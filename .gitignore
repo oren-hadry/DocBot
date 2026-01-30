@@ -1,0 +1,31 @@
+# Environment
+.env
+venv/
+.venv/
+
+# Google credentials (sensitive!)
+credentials.json
+tokens/
+
+# User data (sensitive!)
+profiles/
+contacts/
+
+# Temp files
+temp/
+*.ogg
+*.mp3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
