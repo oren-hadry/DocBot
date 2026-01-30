@@ -8,11 +8,13 @@ No Google account required!
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from docx import Document
+from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -22,7 +24,7 @@ import config
 from data.session_manager import ReportSession
 from data.user_profile import UserProfile
 from data.contacts_manager import Contact
-from lang import _ as t
+from lang import _ as t, get_current_language
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +35,8 @@ REPORTS_DIR.mkdir(exist_ok=True)
 
 class WordGenerator:
     """Generates professional inspection reports as Word documents."""
+    
+    _DEFAULT_FONT = "Arial"
     
     def __init__(self):
         self.openai_client = OpenAI(api_key=config.OPENAI_API_KEY)
@@ -51,7 +55,7 @@ class WordGenerator:
         logger.info(f"Generating Word report for user {session.user_id}")
         
         # Step 1: Use GPT to structure the content
-        structured_content = await self._structure_content(session)
+        structured_content = await self._structure_content(session, user_profile)
         
         # Step 2: Create Word document
         doc_path = await self._create_word_doc(
@@ -63,12 +67,28 @@ class WordGenerator:
         
         return doc_path
     
-    async def _structure_content(self, session: ReportSession) -> dict:
+    def _resolve_report_language(self, user_profile: UserProfile, notes: str) -> str:
+        """Choose a consistent report language (he/en)."""
+        if user_profile.default_language and user_profile.default_language != "auto":
+            return user_profile.default_language
+        
+        lang_code = get_current_language()
+        if lang_code in ("he", "en"):
+            return lang_code
+        
+        # Fallback heuristic based on notes
+        hebrew_chars = len(re.findall(r"[\u0590-\u05FF]", notes))
+        latin_chars = len(re.findall(r"[A-Za-z]", notes))
+        return "he" if hebrew_chars >= latin_chars else "en"
+    
+    async def _structure_content(self, session: ReportSession, user_profile: UserProfile) -> dict:
         """Use GPT to organize notes into structured findings."""
         
         all_notes = session.get_all_notes()
         num_photos = len(session.photos)
         location = session.location or "Site"
+        report_lang = self._resolve_report_language(user_profile, all_notes)
+        report_lang_name = "Hebrew" if report_lang == "he" else "English"
         
         # If no notes, return basic structure
         if not all_notes.strip():
@@ -102,7 +122,7 @@ Structure this into a professional inspection report. Output JSON:
 }}
 
 Rules:
-- Keep SAME LANGUAGE as the input notes (Hebrew/English/etc)
+- Write the report in {report_lang_name} only
 - Be concise and professional
 - Create one finding per distinct issue mentioned
 - If severity isn't clear, use "normal"
@@ -144,6 +164,29 @@ Rules:
         
         doc = Document()
         
+        def set_run_font(run, font_name: str) -> None:
+            if not run or not font_name:
+                return
+            run.font.name = font_name
+            r_pr = run._element.get_or_add_rPr()
+            r_fonts = r_pr.get_or_add_rFonts()
+            r_fonts.set(qn("w:ascii"), font_name)
+            r_fonts.set(qn("w:hAnsi"), font_name)
+            r_fonts.set(qn("w:eastAsia"), font_name)
+            r_fonts.set(qn("w:cs"), font_name)
+        
+        def apply_paragraph_formatting(paragraph) -> None:
+            if not paragraph or not paragraph.text:
+                return
+            is_rtl = bool(re.search(r"[\u0590-\u08FF]", paragraph.text))
+            if is_rtl:
+                p_pr = paragraph._p.get_or_add_pPr()
+                p_pr.set(qn("w:bidi"), "1")
+                if paragraph.alignment in (None, WD_ALIGN_PARAGRAPH.LEFT):
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            for run in paragraph.runs:
+                set_run_font(run, self._DEFAULT_FONT)
+        
         # Set document margins
         sections = doc.sections
         for section in sections:
@@ -182,7 +225,7 @@ Rules:
             run.font.color.rgb = RGBColor(100, 100, 100)
         
         # Separator line
-        doc.add_paragraph("━" * 60)
+        doc.add_paragraph()
         
         # ========== REPORT TITLE ==========
         title_para = doc.add_heading(title, level=1)
@@ -301,6 +344,13 @@ Rules:
         footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
         footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         footer_para.add_run(f"{profile.get_company_display()} | {t('doc_generated_by_docbot')}")
+        
+        # Normalize fonts and RTL across all paragraphs
+        for paragraph in doc.paragraphs:
+            apply_paragraph_formatting(paragraph)
+        for section in doc.sections:
+            for paragraph in section.footer.paragraphs:
+                apply_paragraph_formatting(paragraph)
         
         # ========== SAVE DOCUMENT ==========
         # Create unique filename
