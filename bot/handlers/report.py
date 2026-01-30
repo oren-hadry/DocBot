@@ -17,6 +17,8 @@ from services.word_generator import word_generator
 from data.session_manager import session_manager
 from data.contacts_manager import contacts_manager
 from data.user_profile import profile_manager
+from data.user_options import user_options
+from data.user_stats import user_stats
 
 logger = logging.getLogger(__name__)
 
@@ -30,12 +32,21 @@ async def new_report_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = update.effective_user.id
     
     session_manager.create_session(user_id)
+    user_stats.increment(user_id, "reports_started")
     
-    keyboard = [[InlineKeyboardButton(t("btn_skip"), callback_data="report_skip_location")]]
+    locations = user_options.get_locations(user_id)[:5]
+    
+    keyboard = []
+    for i, loc in enumerate(locations):
+        keyboard.append([
+            InlineKeyboardButton(loc, callback_data=f"report_location_{i}")
+        ])
+    keyboard.append([InlineKeyboardButton(t("btn_skip"), callback_data="report_skip_location")])
     reply_markup = InlineKeyboardMarkup(keyboard)
+    context.user_data["location_choices"] = locations
     
     await update.message.reply_text(
-        t("new_report_title") + "\n\n" + t("ask_location"),
+        t("new_report_title") + "\n\n" + (t("ask_location_with_choices") if locations else t("ask_location")),
         parse_mode="Markdown",
         reply_markup=reply_markup,
     )
@@ -49,8 +60,43 @@ async def report_receive_location(update: Update, context: ContextTypes.DEFAULT_
     
     if session:
         session.location = update.message.text.strip()
+        user_options.add_location(user_id, session.location)
+        user_stats.increment(user_id, "locations_used")
+    
+    context.user_data.pop("location_choices", None)
     
     return await show_participant_selection(update, context)
+
+
+async def report_select_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Select a saved location from inline buttons."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    session = session_manager.get_session(user_id)
+    
+    try:
+        index = int(query.data.replace("report_location_", ""))
+    except ValueError:
+        await query.edit_message_text(t("ask_location"))
+        return ReportState.WAITING_LOCATION.value
+    
+    locations = context.user_data.get("location_choices", [])
+    if index < 0 or index >= len(locations):
+        await query.edit_message_text(t("ask_location"))
+        return ReportState.WAITING_LOCATION.value
+    
+    location = locations[index]
+    if session:
+        session.location = location
+        user_options.add_location(user_id, location)
+        user_stats.increment(user_id, "locations_used")
+    
+    context.user_data.pop("location_choices", None)
+    
+    await query.edit_message_text(t("location_selected", location=location))
+    return await show_participant_selection(query.message, context, from_callback=True)
 
 
 async def report_skip_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -58,6 +104,7 @@ async def report_skip_location(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(t("location_not_specified"))
+    context.user_data.pop("location_choices", None)
     return await show_participant_selection(update, context, from_callback=True)
 
 
@@ -226,6 +273,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     photo_path = config.TEMP_DIR / f"{user_id}_{photo.file_unique_id}.jpg"
     await file.download_to_drive(photo_path)
     session.add_photo(str(photo_path))
+    user_stats.increment(user_id, "photos_added")
     
     count = len(session.photos)
     keyboard = [
@@ -267,6 +315,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     try:
         transcription = await voice_transcriber.transcribe(str(voice_path))
         session.add_voice_note(transcription)
+        user_stats.increment(user_id, "voice_notes_added")
         
         keyboard = [[InlineKeyboardButton(t("btn_create_report"), callback_data="create_report")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -296,6 +345,7 @@ async def handle_text_in_report(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     
     session.add_text_note(update.message.text)
+    user_stats.increment(user_id, "text_notes_added")
     
     keyboard = [[InlineKeyboardButton(t("btn_create_report"), callback_data="create_report")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -332,6 +382,7 @@ async def create_report_callback(update: Update, context: ContextTypes.DEFAULT_T
         
         # Generate Word document
         doc_path = await word_generator.generate(session, profile, participants)
+        user_stats.increment(user_id, "reports_created")
         
         # Clean up session
         session_manager.delete_session(user_id)
@@ -370,6 +421,7 @@ async def cancel_report_callback(update: Update, context: ContextTypes.DEFAULT_T
     user_id = update.effective_user.id
     session_manager.delete_session(user_id)
     context.user_data.pop("selected_participants", None)
+    user_stats.increment(user_id, "reports_cancelled")
     
     await query.edit_message_text(t("report_cancelled"))
     return ConversationHandler.END
@@ -403,4 +455,5 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel current report."""
     user_id = update.effective_user.id
     session_manager.delete_session(user_id)
+    user_stats.increment(user_id, "reports_cancelled")
     await update.message.reply_text(t("report_cancelled"))

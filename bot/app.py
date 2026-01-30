@@ -26,6 +26,7 @@ from bot.handlers import (
     new_report_command,
     report_receive_location,
     report_skip_location,
+    report_select_location,
     toggle_participant,
     report_done_participants,
     report_skip_participants,
@@ -40,6 +41,7 @@ from bot.handlers import (
     contacts_command,
     add_contact_start,
     contact_receive_name,
+    contact_receive_shared,
     contact_receive_email,
     contact_skip_email,
     contact_receive_org,
@@ -78,6 +80,7 @@ def create_application() -> Application:
             ReportState.WAITING_LOCATION.value: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, report_receive_location),
                 CallbackQueryHandler(report_skip_location, pattern="^report_skip_location$"),
+                CallbackQueryHandler(report_select_location, pattern="^report_location_"),
             ],
             ReportState.SELECTING_PARTICIPANTS.value: [
                 CallbackQueryHandler(toggle_participant, pattern="^toggle_participant_"),
@@ -95,6 +98,7 @@ def create_application() -> Application:
             # Contact addition states (nested within report flow)
             ContactState.WAITING_NAME.value: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_name),
+                MessageHandler(filters.CONTACT, contact_receive_shared),
             ],
             ContactState.WAITING_EMAIL.value: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_email),
@@ -121,6 +125,7 @@ def create_application() -> Application:
         states={
             ContactState.WAITING_NAME.value: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_name),
+                MessageHandler(filters.CONTACT, contact_receive_shared),
             ],
             ContactState.WAITING_EMAIL.value: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_email),

@@ -10,6 +10,8 @@ tokens/
 # User data (sensitive!)
 profiles/
 contacts/
+options/
+stats/
 
 # Temp files
 temp/
