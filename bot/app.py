@@ -71,7 +71,7 @@ def create_application() -> Application:
     # Conversation Handlers
     # ========================================================================
     
-    # Report conversation handler
+    # Report conversation handler (includes contact addition within report flow)
     report_handler = ConversationHandler(
         entry_points=[CommandHandler("new", new_report_command)],
         states={
@@ -91,6 +91,18 @@ def create_application() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_in_report),
                 CallbackQueryHandler(create_report_callback, pattern="^create_report$"),
                 CallbackQueryHandler(cancel_report_callback, pattern="^cancel_report$"),
+            ],
+            # Contact addition states (nested within report flow)
+            ContactState.WAITING_NAME.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_name),
+            ],
+            ContactState.WAITING_EMAIL.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_email),
+                CallbackQueryHandler(contact_skip_email, pattern="^contact_skip_email$"),
+            ],
+            ContactState.WAITING_ORG.value: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, contact_receive_org),
+                CallbackQueryHandler(contact_skip_org, pattern="^contact_skip_org$"),
             ],
         },
         fallbacks=[

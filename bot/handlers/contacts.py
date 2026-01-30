@@ -154,7 +154,8 @@ async def save_new_contact(update, context, user_id, org, from_callback=False):
         else:
             await update.message.reply_text(message, parse_mode="Markdown")
         
-        return await show_participant_selection(update, context, from_callback=True)
+        # Pass the correct from_callback value based on how we got here
+        return await show_participant_selection(update, context, from_callback=from_callback)
     
     if from_callback:
         await update.callback_query.edit_message_text(message, parse_mode="Markdown")
