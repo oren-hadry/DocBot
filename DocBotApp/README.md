@@ -2,21 +2,23 @@
 
 Fresh app + backend scaffold for a simple inspection report flow.
 
-## Structure
-- `DocBotApp/backend/` — FastAPI backend (Word report generation)
-- `DocBotApp/app/` — Flutter client (mobile-first)
+## Backend (FastAPI)
+- Install: `pip install -r backend/requirements.txt`
+- Run: `uvicorn api.main:app --reload --port 8000 --app-dir backend`
 
-## Backend
-- `cd DocBotApp/backend`
-- `pip install -r requirements.txt`
-- `uvicorn api.main:app --reload --port 8000 --app-dir .`
+### Environment
+Copy `backend/.env.example` to `backend/.env` and update:
+- `API_SECRET`
+- `CORS_ORIGINS`
+- `STORAGE_DIR` (optional)
 
-## App
-- `cd DocBotApp/app`
-- `flutter create .` (first time only)
+## App (Flutter)
+This is a minimal Flutter client. If Flutter is not initialized in the folder:
+- `cd app`
+- `flutter create .`
 - `flutter pub get`
 - `flutter run`
 
 ## Notes
-- Word files are saved per user under `DocBotApp/backend/storage/<user_id>/reports/`.
-- Storage is separated by user id.
+- Word reports are generated server-side and saved per user in `backend/storage/<user_id>/reports/`.
+- Storage is separated per user by path.

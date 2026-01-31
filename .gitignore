@@ -12,6 +12,8 @@ profiles/
 contacts/
 options/
 stats/
+users/
+storage/
 
 # Temp files
 temp/
@@ -31,3 +33,4 @@ build/
 *.swp
 *.swo
 .DS_Store
+

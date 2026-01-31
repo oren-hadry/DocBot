@@ -1,0 +1,38 @@
+name: docbot_app
+description: Simple DocBotApp client
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ">=3.0.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  http: any
+  image_picker: any
+  path_provider: any
+  open_filex: any
+  share_plus: any
+  speech_to_text: any
+  shared_preferences: any
+  permission_handler: any
+  flutter_contacts: any
+  url_launcher: any
+  record: any
+  photo_manager: any
+  in_app_update: any
+  package_info_plus: any
+
+flutter:
+  uses-material-design: true
+
+dev_dependencies:
+  flutter_launcher_icons: any
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/app_icon.png"
