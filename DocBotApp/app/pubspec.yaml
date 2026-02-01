@@ -25,6 +25,8 @@ dependencies:
   photo_manager: any
   in_app_update: any
   package_info_plus: any
+  flutter_secure_storage: any
+  crypto: any
 
 flutter:
   uses-material-design: true

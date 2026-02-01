@@ -1,5 +1,6 @@
 import "dart:convert";
 import "dart:io";
+import "dart:typed_data";
 
 import "package:flutter/foundation.dart";
 import "package:flutter/material.dart";
@@ -19,10 +20,14 @@ import "package:photo_manager/photo_manager.dart";
 import "package:in_app_update/in_app_update.dart";
 import "package:package_info_plus/package_info_plus.dart";
 import "package:flutter/services.dart";
+import "package:flutter_secure_storage/flutter_secure_storage.dart";
+import "package:crypto/crypto.dart";
 import "l10n/strings.dart";
 import "local/history_store.dart";
 
 const String _apiBaseUrlEnv = String.fromEnvironment("API_BASE_URL", defaultValue: "");
+const bool _allowInsecureHttp = bool.fromEnvironment("ALLOW_INSECURE_HTTP", defaultValue: false);
+const String _pinnedCertSha256 = String.fromEnvironment("PINNED_CERT_SHA256", defaultValue: "");
 const String _iosBundleId = "com.example.docbot_app";
 const String _iosAppStoreId = "";
 
@@ -46,6 +51,63 @@ final String apiBaseUrl = resolveApiBaseUrl();
 final ValueNotifier<Locale> appLocale = ValueNotifier(const Locale("he", "IL"));
 final ValueNotifier<bool> isLoggedIn = ValueNotifier(false);
 final ValueNotifier<String?> currentUserKey = ValueNotifier(null);
+const _secureStorage = FlutterSecureStorage();
+
+String _bytesToHex(Uint8List bytes) {
+  final buffer = StringBuffer();
+  for (final b in bytes) {
+    buffer.write(b.toRadixString(16).padLeft(2, "0"));
+  }
+  return buffer.toString();
+}
+
+class PinnedHttpOverrides extends HttpOverrides {
+  PinnedHttpOverrides(this.pinnedSha256);
+
+  final String pinnedSha256;
+
+  @override
+  HttpClient createHttpClient(SecurityContext? context) {
+    final client = super.createHttpClient(context);
+    if (pinnedSha256.isEmpty) return client;
+    client.badCertificateCallback = (cert, host, port) {
+      try {
+        final hash = sha256.convert(cert.der).bytes;
+        final hex = _bytesToHex(Uint8List.fromList(hash));
+        return hex == pinnedSha256.toLowerCase();
+      } catch (_) {
+        return false;
+      }
+    };
+    return client;
+  }
+}
+
+Future<String?> _readAuthToken() async {
+  if (kIsWeb) {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString("auth_token");
+  }
+  return _secureStorage.read(key: "auth_token");
+}
+
+Future<void> _writeAuthToken(String token) async {
+  if (kIsWeb) {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString("auth_token", token);
+    return;
+  }
+  await _secureStorage.write(key: "auth_token", value: token);
+}
+
+Future<void> _deleteAuthToken() async {
+  if (kIsWeb) {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove("auth_token");
+    return;
+  }
+  await _secureStorage.delete(key: "auth_token");
+}
 
 void toggleLocale() {
   final current = appLocale.value.languageCode;
@@ -138,11 +200,17 @@ String _deriveUserKey(Map<String, dynamic> profile) {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  final prefs = await SharedPreferences.getInstance();
-  final token = prefs.getString("auth_token");
+  if (!kIsWeb && _pinnedCertSha256.isNotEmpty) {
+    HttpOverrides.global = PinnedHttpOverrides(_pinnedCertSha256);
+  }
+  if (!kIsWeb && kReleaseMode && apiBaseUrl.startsWith("http://") && !_allowInsecureHttp) {
+    throw StateError("Insecure HTTP is blocked in release builds.");
+  }
+  final token = await _readAuthToken();
   if (token != null && token.isNotEmpty) {
     api.token = token;
     isLoggedIn.value = true;
+    final prefs = await SharedPreferences.getInstance();
     final storedKey = prefs.getString("current_user_key");
     if (storedKey != null && storedKey.isNotEmpty) {
       currentUserKey.value = storedKey;
@@ -602,11 +670,11 @@ class ApiClient {
     }
   }
 
-  Future<String> addItem(String description, String notes) async {
+  Future<String> addItem(String description, String notes, {bool allowEmpty = false}) async {
     final resp = await http.post(
       Uri.parse("$apiBaseUrl/reports/item"),
       headers: _headers(),
-      body: jsonEncode({"description": description, "notes": notes}),
+      body: jsonEncode({"description": description, "notes": notes, "allow_empty": allowEmpty}),
     );
     if (resp.statusCode != 200) {
       throw Exception(resp.body);
@@ -740,7 +808,7 @@ final api = ApiClient();
 
 Future<void> logout(BuildContext context) async {
   final prefs = await SharedPreferences.getInstance();
-  await prefs.remove("auth_token");
+  await _deleteAuthToken();
   await prefs.remove("current_user_key");
   api.token = null;
   currentUserKey.value = null;
@@ -765,6 +833,7 @@ class _LoginScreenState extends State<LoginScreen> {
   final passwordController = TextEditingController();
   final emailController = TextEditingController();
   String? error;
+  String? connectionStatus;
   bool loading = false;
   bool emailEditable = false;
 
@@ -835,10 +904,24 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _testConnection() async {
+    setState(() => connectionStatus = null);
+    try {
+      final resp = await http.get(Uri.parse("$apiBaseUrl/health"));
+      if (resp.statusCode == 200) {
+        setState(() => connectionStatus = "OK");
+      } else {
+        setState(() => connectionStatus = "HTTP ${resp.statusCode}");
+      }
+    } catch (e) {
+      setState(() => connectionStatus = "Failed: ${e.toString()}");
+    }
+  }
+
   Future<void> _saveToken(String token) async {
     api.token = token;
+    await _writeAuthToken(token);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString("auth_token", token);
     try {
       final profile = await api.getCurrentUser();
       final key = _deriveUserKey(profile);
@@ -964,6 +1047,23 @@ class _LoginScreenState extends State<LoginScreen> {
               onPressed: loading ? null : _auth,
               child: Text(t(context, "login_button")),
             ),
+            const SizedBox(height: 24),
+            const Divider(),
+            Text(
+              "API: $apiBaseUrl",
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: _testConnection,
+              icon: const Icon(Icons.network_check),
+              label: const Text("Test Connection"),
+            ),
+            if (connectionStatus != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(connectionStatus!, style: Theme.of(context).textTheme.bodySmall),
+              ),
           ],
         ),
       ),
@@ -1695,6 +1795,8 @@ class AddItemScreen extends StatefulWidget {
 class _AddItemScreenState extends State<AddItemScreen> {
   final descriptionController = TextEditingController();
   final notesController = TextEditingController();
+  final FocusNode descriptionFocus = FocusNode();
+  final FocusNode notesFocus = FocusNode();
   File? photo;
   String? currentItemId;
   String? activeItemId;
@@ -1704,6 +1806,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
   bool isRecording = false;
   String lastTranscript = "";
   String? recordingItemId;
+  String? recordingField;
   String? lastRecordingPath;
   List<String> descriptionHistory = [];
   List<String> notesHistory = [];
@@ -1714,6 +1817,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
   Map<String, String> itemAudioPaths = {};
   String? sessionLocation;
   String? sessionTitle;
+  bool _initialItemCreated = false;
 
   @override
   void initState() {
@@ -1726,7 +1830,9 @@ class _AddItemScreenState extends State<AddItemScreen> {
   void dispose() {
     audioRecorder.dispose();
     descriptionController.dispose();
+    descriptionFocus.dispose();
     notesController.dispose();
+    notesFocus.dispose();
     super.dispose();
   }
 
@@ -1757,8 +1863,42 @@ class _AddItemScreenState extends State<AddItemScreen> {
             activeItemId = null;
           }
         });
+        if (session.items.isEmpty && !_initialItemCreated) {
+          _initialItemCreated = true;
+          await _createEmptyItem();
+        }
       }
     } catch (_) {}
+  }
+
+  bool _itemHasPhoto(String? itemId) {
+    if (itemId == null) return false;
+    final photos = itemPhotos[itemId] ?? [];
+    return photos.isNotEmpty;
+  }
+
+  bool _itemHasContent(ReportItemData item) {
+    return item.description.trim().isNotEmpty ||
+        item.notes.trim().isNotEmpty ||
+        _itemHasPhoto(item.id);
+  }
+
+  Future<void> _createEmptyItem() async {
+    try {
+      final id = await api.addItem("", "", allowEmpty: true);
+      setState(() {
+        currentItemId = id;
+        activeItemId = id;
+        editingItemId = id;
+        descriptionController.clear();
+        notesController.clear();
+        lastTranscript = "";
+        lastRecordingPath = null;
+      });
+      await _loadExistingItems();
+    } catch (e) {
+      setState(() => error = e.toString());
+    }
   }
 
   Future<String?> _resolveSpeechLocale() async {
@@ -1789,8 +1929,8 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
   }
 
-  Future<void> _backupPhotoToDevice(String path) async {
-    if (kIsWeb) return;
+  Future<String?> _backupPhotoToDevice(String path) async {
+    if (kIsWeb) return null;
     try {
       // Android emulator/device path maps to: /data/data/<package>/app_flutter/...
       final dir = await getApplicationDocumentsDirectory();
@@ -1801,8 +1941,11 @@ class _AddItemScreenState extends State<AddItemScreen> {
       final dotIndex = path.lastIndexOf(".");
       final ext = dotIndex == -1 ? "" : path.substring(dotIndex);
       final filename = "photo_${DateTime.now().millisecondsSinceEpoch}$ext";
-      await File(path).copy("${backupDir.path}/$filename");
+      final target = "${backupDir.path}/$filename";
+      await File(path).copy(target);
+      return target;
     } catch (_) {}
+    return null;
   }
 
   void _cleanupTempMedia(String path) {
@@ -1831,7 +1974,15 @@ class _AddItemScreenState extends State<AddItemScreen> {
       final path = "${recordingsDir.path}/$filename";
       final hasPerm = await audioRecorder.hasPermission();
       if (!hasPerm) return;
-      await audioRecorder.start(const RecordConfig(encoder: AudioEncoder.aacLc), path: path);
+      await audioRecorder.start(
+        RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          sampleRate: 16000,
+          numChannels: 1,
+          androidConfig: AndroidRecordConfig(audioSource: AndroidAudioSource.mic),
+        ),
+        path: path,
+      );
       setState(() => lastRecordingPath = null);
     } catch (_) {}
   }
@@ -1897,7 +2048,11 @@ class _AddItemScreenState extends State<AddItemScreen> {
         ],
         if (audioPath != null) ...[
           const SizedBox(height: 6),
-          Text("${t(context, "attached_audio_label")}: $audioPath"),
+          OutlinedButton.icon(
+            onPressed: () => OpenFilex.open(audioPath),
+            icon: const Icon(Icons.play_arrow),
+            label: Text(t(context, "attached_audio_label")),
+          ),
         ],
       ],
     );
@@ -1918,6 +2073,14 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
     final newNotes = item.notes.isEmpty ? transcript : "${item.notes}\n$transcript";
     await api.updateItem(itemId, item.description, newNotes);
+    if (editingItemId == itemId) {
+      setState(() {
+        notesController.text = newNotes;
+        notesController.selection = TextSelection.fromPosition(
+          TextPosition(offset: notesController.text.length),
+        );
+      });
+    }
     await _loadExistingItems();
   }
 
@@ -1998,18 +2161,15 @@ class _AddItemScreenState extends State<AddItemScreen> {
 
   Future<bool> _ensureActiveItemForMedia() async {
     if (activeItemId != null) return true;
-    final descriptionTrimmed = descriptionController.text.trim();
-    final notesTrimmed = notesController.text.trim();
-    if (descriptionTrimmed.isNotEmpty || notesTrimmed.isNotEmpty) {
-      return await _createItemFromDraftForMedia();
+    if (existingItems.isNotEmpty) {
+      final selected = await _promptForItemSelection();
+      if (selected != null) {
+        setState(() => activeItemId = selected);
+        return true;
+      }
     }
-    final selected = await _promptForItemSelection();
-    if (selected != null) {
-      setState(() => activeItemId = selected);
-      return true;
-    }
-    setState(() => error = t(context, "error_photo_needs_item"));
-    return false;
+    await _createEmptyItem();
+    return activeItemId != null;
   }
 
   Future<void> _addItem() async {
@@ -2017,6 +2177,10 @@ class _AddItemScreenState extends State<AddItemScreen> {
       final descriptionTrimmed = descriptionController.text.trim();
       final notesTrimmed = notesController.text.trim();
       if (descriptionTrimmed.isEmpty && notesTrimmed.isEmpty) {
+        if (_itemHasPhoto(activeItemId)) {
+          await _createEmptyItem();
+          return;
+        }
         setState(() => error = t(context, "error_item_empty"));
         return;
       }
@@ -2088,11 +2252,12 @@ class _AddItemScreenState extends State<AddItemScreen> {
     if (picked != null) {
       setState(() => photo = File(picked.path));
       final saved = await _savePhotoToGallery(picked.path);
+      String? backupPath;
       if (!saved) {
-        await _backupPhotoToDevice(picked.path);
+        backupPath = await _backupPhotoToDevice(picked.path);
       }
       _cleanupTempMedia(picked.path);
-      await _uploadPhotoFile(File(picked.path), activeItemId!);
+      await _uploadPhotoFile(File(picked.path), activeItemId!, backupPath: backupPath);
     }
   }
 
@@ -2107,11 +2272,12 @@ class _AddItemScreenState extends State<AddItemScreen> {
     if (picked == null) return;
     try {
       final saved = await _savePhotoToGallery(picked.path);
+      String? backupPath;
       if (!saved) {
-        await _backupPhotoToDevice(picked.path);
+        backupPath = await _backupPhotoToDevice(picked.path);
       }
       _cleanupTempMedia(picked.path);
-      await api.uploadPhoto(File(picked.path), itemId: itemId);
+      await _uploadPhotoFile(File(picked.path), itemId, backupPath: backupPath);
       await _loadExistingItems();
     } catch (e) {
       setState(() => error = e.toString());
@@ -2131,18 +2297,24 @@ class _AddItemScreenState extends State<AddItemScreen> {
     final picked = await picker.pickImage(source: ImageSource.gallery);
     if (picked == null) return;
     final saved = await _savePhotoToGallery(picked.path);
+    String? backupPath;
     if (!saved) {
-      await _backupPhotoToDevice(picked.path);
+      backupPath = await _backupPhotoToDevice(picked.path);
     }
     _cleanupTempMedia(picked.path);
-    await _uploadPhotoFile(File(picked.path), activeItemId!);
+    await _uploadPhotoFile(File(picked.path), activeItemId!, backupPath: backupPath);
   }
 
-  Future<void> _uploadPhotoFile(File file, String itemId) async {
+  Future<void> _uploadPhotoFile(File file, String itemId, {String? backupPath}) async {
     try {
       await api.uploadPhoto(file, itemId: itemId);
       if (mounted) {
         setState(() => photo = null);
+      }
+      if (backupPath != null) {
+        try {
+          await File(backupPath).delete();
+        } catch (_) {}
       }
       await _loadExistingItems();
     } catch (e) {
@@ -2280,7 +2452,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
     return true;
   }
 
-  Future<void> _toggleRecording({String? targetItemId}) async {
+  Future<void> _toggleRecording({String? targetItemId, String? targetField}) async {
     try {
       if (!isRecording) {
         final micOk = await Permission.microphone.request();
@@ -2305,6 +2477,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
           isRecording = true;
           lastTranscript = "";
           recordingItemId = targetItemId;
+          recordingField = targetField;
         });
         await speech.listen(
           localeId: speechLocaleId,
@@ -2314,10 +2487,17 @@ class _AddItemScreenState extends State<AddItemScreen> {
             setState(() {
               lastTranscript = result.recognizedWords;
               if (recordingItemId == null) {
-                descriptionController.text = lastTranscript;
-                descriptionController.selection = TextSelection.fromPosition(
-                  TextPosition(offset: descriptionController.text.length),
-                );
+                if (recordingField == "description") {
+                  descriptionController.text = lastTranscript;
+                  descriptionController.selection = TextSelection.fromPosition(
+                    TextPosition(offset: descriptionController.text.length),
+                  );
+                } else {
+                  notesController.text = lastTranscript;
+                  notesController.selection = TextSelection.fromPosition(
+                    TextPosition(offset: notesController.text.length),
+                  );
+                }
               }
             });
           },
@@ -2329,6 +2509,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
         setState(() {
           isRecording = false;
           recordingItemId = null;
+          recordingField = null;
         });
         if (target != null && lastTranscript.isNotEmpty) {
           await _applyTranscriptToItem(target, lastTranscript);
@@ -2361,13 +2542,13 @@ class _AddItemScreenState extends State<AddItemScreen> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-            if (existingItems.isNotEmpty)
+            if (existingItems.where(_itemHasContent).isNotEmpty)
               SizedBox(
                 height: 120,
                 child: ListView.builder(
-                  itemCount: existingItems.length,
+                  itemCount: existingItems.where(_itemHasContent).length,
                   itemBuilder: (context, index) {
-                    final item = existingItems[index];
+                    final item = existingItems.where(_itemHasContent).toList()[index];
                     return ListTile(
                       title: Text("${item.number}. ${item.description}"),
                       subtitle: Text(item.notes),
@@ -2382,33 +2563,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
                           notesController.text = item.notes;
                         });
                       },
-                      trailing: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          IconButton(
-                            icon: const Icon(Icons.photo_camera),
-                            onPressed: () => _takePhotoForItem(item.id),
-                          ),
-                          IconButton(
-                            icon: Icon(isRecording && recordingItemId == item.id ? Icons.stop : Icons.mic),
-                            onPressed: isRecording && recordingItemId != item.id
-                                ? null
-                                : () => _toggleRecording(targetItemId: item.id),
-                          ),
-                          IconButton(
-                            icon: const Icon(Icons.edit),
-                            onPressed: () {
-                              setState(() {
-                                activeItemId = item.id;
-                                currentItemId = item.id;
-                                editingItemId = item.id;
-                                descriptionController.text = item.description;
-                                notesController.text = item.notes;
-                              });
-                            },
-                          ),
-                        ],
-                      ),
                     );
                   },
                 ),
@@ -2432,12 +2586,42 @@ class _AddItemScreenState extends State<AddItemScreen> {
                 });
                 return TextField(
                   controller: controller,
-                  focusNode: focusNode,
+                  focusNode: descriptionFocus,
                   textDirection: _textDirection(context),
                   textAlign: _textAlign(context),
+                  keyboardType: TextInputType.multiline,
+                  minLines: 3,
+                  maxLines: null,
                   decoration: InputDecoration(labelText: t(context, "description_label")),
                 );
               },
+            ),
+            Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.photo_camera, size: 18),
+                  tooltip: t(context, "take_photo_button"),
+                  onPressed: () {
+                    descriptionFocus.requestFocus();
+                    _takePhoto();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.photo_library, size: 18),
+                  tooltip: t(context, "upload_photo_button"),
+                  onPressed: () {
+                    descriptionFocus.requestFocus();
+                    _uploadPhoto();
+                  },
+                ),
+                IconButton(
+                  icon: Icon(isRecording && recordingField == "description" ? Icons.stop : Icons.mic, size: 18),
+                  tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
+                  onPressed: isRecording && recordingField != "description"
+                      ? null
+                      : () => _toggleRecording(targetField: "description"),
+                ),
+              ],
             ),
             Autocomplete<String>(
               optionsBuilder: (value) {
@@ -2458,12 +2642,42 @@ class _AddItemScreenState extends State<AddItemScreen> {
                 });
                 return TextField(
                   controller: controller,
-                  focusNode: focusNode,
+                  focusNode: notesFocus,
                   textDirection: _textDirection(context),
                   textAlign: _textAlign(context),
+                  keyboardType: TextInputType.multiline,
+                  minLines: 3,
+                  maxLines: null,
                   decoration: InputDecoration(labelText: t(context, "notes_label")),
                 );
               },
+            ),
+            Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.photo_camera, size: 18),
+                  tooltip: t(context, "take_photo_button"),
+                  onPressed: () {
+                    notesFocus.requestFocus();
+                    _takePhoto();
+                  },
+                ),
+                IconButton(
+                  icon: const Icon(Icons.photo_library, size: 18),
+                  tooltip: t(context, "upload_photo_button"),
+                  onPressed: () {
+                    notesFocus.requestFocus();
+                    _uploadPhoto();
+                  },
+                ),
+                IconButton(
+                  icon: Icon(isRecording && recordingField == "notes" ? Icons.stop : Icons.mic, size: 18),
+                  tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
+                  onPressed: isRecording && recordingField != "notes"
+                      ? null
+                      : () => _toggleRecording(targetField: "notes"),
+                ),
+              ],
             ),
             _buildAttachments(),
             const SizedBox(height: 12),
@@ -2503,7 +2717,11 @@ class _AddItemScreenState extends State<AddItemScreen> {
             if (lastRecordingPath != null)
               Padding(
                 padding: const EdgeInsets.only(top: 6),
-                child: Text("${t(context, "audio_saved_label")}: $lastRecordingPath"),
+                child: OutlinedButton.icon(
+                  onPressed: () => OpenFilex.open(lastRecordingPath!),
+                  icon: const Icon(Icons.play_arrow),
+                  label: Text(t(context, "audio_saved_label")),
+                ),
               ),
             const SizedBox(height: 12),
             ElevatedButton(onPressed: _addItem, child: Text(t(context, "add_item_button"))),

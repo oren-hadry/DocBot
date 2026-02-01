@@ -13,6 +13,7 @@ from data.templates import TEMPLATES
 from data.report_manager import report_manager
 from data.locations import locations_manager
 from data.report_store import report_store
+from data.audit_log import log_event
 from data.stats import stats_manager
 from data.storage import user_temp_dir
 from data.word_generator import generate_report_docx
@@ -29,6 +30,7 @@ class StartReportRequest(BaseModel):
 class AddItemRequest(BaseModel):
     description: str
     notes: Optional[str] = ""
+    allow_empty: Optional[bool] = False
 
 
 class SetContactsRequest(BaseModel):
@@ -48,7 +50,7 @@ class OrganizeRequest(BaseModel):
 
 @router.post("/start")
 def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
-    report_manager.create_session(
+    session = report_manager.create_session(
         user.user_id,
         location=payload.location or "",
         template_key=payload.template_key or "",
@@ -56,6 +58,11 @@ def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
     if payload.location:
         locations_manager.add_location(user.user_id, payload.location)
     stats_manager.increment(user.user_id, "reports_started")
+    log_event(
+        user.user_id,
+        "START_REPORT",
+        {"location": session.location, "template_key": session.template_key},
+    )
     return {"status": "ok"}
 
 
@@ -118,6 +125,11 @@ def set_contacts(payload: SetContactsRequest, user=Depends(get_current_user)):
         report_manager.set_contacts(user.user_id, payload.attendees, payload.distribution_list)
     except ValueError:
         raise HTTPException(status_code=400, detail="No active report")
+    log_event(
+        user.user_id,
+        "SET_CONTACTS",
+        {"attendees": payload.attendees, "distribution_list": payload.distribution_list},
+    )
     return {"status": "ok"}
 
 
@@ -128,10 +140,15 @@ def add_item(payload: AddItemRequest, user=Depends(get_current_user)):
         raise HTTPException(status_code=400, detail="No active report")
     description = payload.description.strip()
     notes = (payload.notes or "").strip()
-    if not description and not notes:
+    if not description and not notes and not payload.allow_empty:
         raise HTTPException(status_code=400, detail="Description or notes required")
     item = report_manager.add_item(user.user_id, description=description, notes=notes)
     stats_manager.increment(user.user_id, "items_added")
+    log_event(
+        user.user_id,
+        "ADD_ITEM",
+        {"item_id": item.id, "number": item.number},
+    )
     return {"status": "ok", "item_id": item.id, "number": item.number}
 
 
@@ -141,6 +158,7 @@ def update_item(item_id: str, payload: UpdateItemRequest, user=Depends(get_curre
         report_manager.update_item(user.user_id, item_id, payload.description.strip(), payload.notes or "")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    log_event(user.user_id, "UPDATE_ITEM", {"item_id": item_id})
     return {"status": "ok"}
 
 
@@ -174,6 +192,11 @@ async def add_photo(
         photo_path.name,
         len(content),
     )
+    log_event(
+        user.user_id,
+        "ADD_PHOTO",
+        {"item_id": item_id, "photo": photo_path.name},
+    )
     return {"status": "ok"}
 
 
@@ -192,6 +215,7 @@ def finalize_report(background_tasks: BackgroundTasks, user=Depends(get_current_
     stats_manager.increment(user.user_id, "reports_created")
 
     filename = os.path.basename(doc_path)
+    log_event(user.user_id, "FINALIZE_REPORT", {"doc": filename})
     return FileResponse(
         path=doc_path,
         filename=filename,
@@ -205,6 +229,7 @@ def cancel_report(user=Depends(get_current_user)):
     if not session:
         raise HTTPException(status_code=400, detail="No active report")
     report_manager.finalize(user.user_id)
+    log_event(user.user_id, "CANCEL_REPORT", {})
     return {"status": "ok"}
 
 
@@ -214,6 +239,7 @@ def open_report(report_id: str, user=Depends(get_current_user)):
     if not data:
         raise HTTPException(status_code=404, detail="Report not found")
     report_manager.load_from_report(data)
+    log_event(user.user_id, "OPEN_REPORT", {"report_id": report_id})
     return {"status": "ok"}
 
 
@@ -222,4 +248,9 @@ def organize_report(report_id: str, payload: OrganizeRequest, user=Depends(get_c
     result = report_store.update_organize(user.user_id, report_id, payload.folder, payload.tags)
     if not result:
         raise HTTPException(status_code=404, detail="Report not found")
+    log_event(
+        user.user_id,
+        "ORGANIZE_REPORT",
+        {"report_id": report_id, "folder": payload.folder, "tags": payload.tags},
+    )
     return {"status": "ok"}

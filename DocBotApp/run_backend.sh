@@ -38,4 +38,4 @@ fi
 
 source .venv/bin/activate
 python -m pip install -r requirements.txt --upgrade
-uvicorn api.main:app --reload --port 8000 --app-dir . --log-level warning --no-access-log
+uvicorn api.main:app --reload --host 0.0.0.0 --port 8000 --app-dir . --log-level info --access-log

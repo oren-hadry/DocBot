@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 API_SECRET = os.getenv("API_SECRET", "change_me")
 API_TOKEN_EXPIRE_MINUTES = int(os.getenv("API_TOKEN_EXPIRE_MINUTES", "10080"))
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "")
 
 # SMTP settings for email verification
 SMTP_HOST = os.getenv("SMTP_HOST", "")

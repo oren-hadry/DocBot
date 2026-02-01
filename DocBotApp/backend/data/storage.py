@@ -41,6 +41,10 @@ def user_reports_index_file(user_id: int) -> Path:
     return user_dir(user_id) / "reports_index.json"
 
 
+def user_audit_file(user_id: int) -> Path:
+    return user_dir(user_id) / "audit.log"
+
+
 def user_report_data_dir(user_id: int, report_id: str) -> Path:
     report_dir = user_reports_dir(user_id) / report_id
     report_dir.mkdir(parents=True, exist_ok=True)
