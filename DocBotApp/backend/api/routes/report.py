@@ -68,7 +68,7 @@ def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
 
 @router.get("/templates")
 def list_templates(user=Depends(get_current_user)):
-    return {"templates": [{"key": t.key, "title": t.title} for t in TEMPLATES]}
+    return {"templates": [{"key": t.key, "title": t.title, "title_he": t.title_he} for t in TEMPLATES]}
 
 
 @router.get("/recent")

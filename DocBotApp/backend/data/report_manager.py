@@ -31,6 +31,7 @@ class ReportSession:
     created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat(timespec="seconds") + "Z")
     location: str = ""
     title: str = "Inspection Report"
+    title_he: str = "דוח פיקוח"
     template_key: str = "INSPECTION_REPORT"
     attendees: list[str] = field(default_factory=list)
     distribution_list: list[str] = field(default_factory=list)
@@ -46,6 +47,7 @@ class ReportSession:
             "created_at": self.created_at,
             "location": self.location,
             "title": self.title,
+            "title_he": self.title_he,
             "template_key": self.template_key,
             "attendees": self.attendees,
             "distribution_list": self.distribution_list,
@@ -60,6 +62,7 @@ class ReportSession:
             created_at=data.get("created_at", datetime.utcnow().isoformat(timespec="seconds") + "Z"),
             location=data.get("location", ""),
             title=data.get("title", "Inspection Report"),
+            title_he=data.get("title_he", "דוח פיקוח"),
             template_key=data.get("template_key", "INSPECTION_REPORT"),
             attendees=data.get("attendees", []),
             distribution_list=data.get("distribution_list", []),
@@ -80,6 +83,7 @@ class ReportManager:
             location=location.strip(),
             template_key=template.key,
             title=template.title,
+            title_he=template.title_he,
         )
         self._sessions[user_id] = session
         self._save_session(session)

@@ -21,7 +21,6 @@ dependencies:
   permission_handler: any
   flutter_contacts: any
   url_launcher: any
-  record: any
   photo_manager: any
   in_app_update: any
   package_info_plus: any

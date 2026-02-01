@@ -23,9 +23,17 @@ from data.user_auth import user_auth
 from data.audit_log import log_event
 import config
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=logging.INFO)
 app = FastAPI(title="DocBotApp API")
 logger = logging.getLogger("docbot.api")
+
+@app.post("/debug/log")
+async def debug_log(payload: dict, user=Depends(get_current_user)):
+    user_id = getattr(user, "user_id", "unknown")
+    event = payload.get("event", "unknown")
+    data = payload.get("data", {})
+    logger.info("DEBUG_LOG: user_id=%s event=%s data=%s", user_id, event, data)
+    return {"status": "ok"}
 
 origins = [o.strip() for o in config.CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(

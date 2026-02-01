@@ -17,6 +17,7 @@ class ReportSummary:
     location: str
     template_key: str
     title: str
+    title_he: str = ""
     folder: str = ""
     tags: list[str] = None
 
@@ -69,6 +70,7 @@ class ReportStore:
             location=session.location,
             template_key=session.template_key,
             title=session.title,
+            title_he=session.title_he,
             folder="",
             tags=[],
         )

@@ -15,7 +15,6 @@ import "package:shared_preferences/shared_preferences.dart";
 import "package:permission_handler/permission_handler.dart";
 import "package:flutter_contacts/flutter_contacts.dart";
 import "package:url_launcher/url_launcher.dart";
-import "package:record/record.dart";
 import "package:photo_manager/photo_manager.dart";
 import "package:in_app_update/in_app_update.dart";
 import "package:package_info_plus/package_info_plus.dart";
@@ -114,6 +113,59 @@ void toggleLocale() {
   appLocale.value = current == "he" ? const Locale("en", "US") : const Locale("he", "IL");
 }
 
+Future<void> clearUserFiles(BuildContext context) async {
+  if (kIsWeb) return;
+  final proceed = await showDialog<bool>(
+    context: context,
+    builder: (context) => AlertDialog(
+      title: Text(t(context, "clean_files_title")),
+      content: Text(t(context, "clean_files_body")),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(t(context, "cancel_button")),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(t(context, "clean_files_button")),
+        ),
+      ],
+    ),
+  );
+  if (proceed != true) return;
+
+  try {
+    final dir = await getApplicationDocumentsDirectory();
+    // 1. Clear photo backups
+    final backupDir = Directory("${dir.path}/photo_backups");
+    if (await backupDir.exists()) {
+      await backupDir.delete(recursive: true);
+      await backupDir.create();
+    }
+    // 2. Clear temp media in app_flutter
+    final list = dir.listSync();
+    for (final item in list) {
+      if (item is File) {
+        final name = item.uri.pathSegments.last;
+        if (name.startsWith("res_timestamp")) {
+          await item.delete();
+        }
+      }
+    }
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(t(context, "clean_files_success"))),
+      );
+    }
+  } catch (e) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text("Error: $e")),
+      );
+    }
+  }
+}
+
 List<Widget> appBarActions(
   BuildContext context, {
   bool showLogout = false,
@@ -131,6 +183,8 @@ List<Widget> appBarActions(
           onSelected?.call(value);
         } else if (value == "logout") {
           logout(context);
+        } else if (value == "clean_files") {
+          clearUserFiles(context);
         } else if (value == "exit_app") {
           SystemNavigator.pop();
         } else {
@@ -148,6 +202,10 @@ List<Widget> appBarActions(
           PopupMenuItem<String>(
             value: "language",
             child: Text(t(context, "toggle_language")),
+          ),
+          PopupMenuItem<String>(
+            value: "clean_files",
+            child: Text(t(context, "clean_files_button")),
           ),
         ];
         if (showLogout) {
@@ -385,13 +443,18 @@ class _UpdateCheckerState extends State<UpdateChecker> {
 }
 
 class TemplateInfo {
-  TemplateInfo({required this.key, required this.title});
+  TemplateInfo({required this.key, required this.title, required this.titleHe});
 
   final String key;
   final String title;
+  final String titleHe;
 
   factory TemplateInfo.fromJson(Map<String, dynamic> json) {
-    return TemplateInfo(key: json["key"], title: json["title"]);
+    return TemplateInfo(
+      key: json["key"],
+      title: json["title"],
+      titleHe: json["title_he"] ?? json["title"],
+    );
   }
 }
 
@@ -431,6 +494,7 @@ class ReportSummary {
     required this.location,
     required this.templateKey,
     required this.title,
+    required this.titleHe,
     required this.folder,
     required this.tags,
   });
@@ -440,6 +504,7 @@ class ReportSummary {
   final String location;
   final String templateKey;
   final String title;
+  final String titleHe;
   final String folder;
   final List<String> tags;
 
@@ -450,6 +515,7 @@ class ReportSummary {
       location: json["location"] ?? "",
       templateKey: json["template_key"] ?? "",
       title: json["title"] ?? "",
+      titleHe: json["title_he"] ?? json["title"] ?? "",
       folder: json["folder"] ?? "",
       tags: (json["tags"] as List?)?.map((e) => e.toString()).toList() ?? [],
     );
@@ -499,6 +565,7 @@ class ActiveSessionData {
     required this.photos,
     required this.location,
     required this.title,
+    required this.titleHe,
     required this.templateKey,
     required this.attendees,
     required this.distributionList,
@@ -508,6 +575,7 @@ class ActiveSessionData {
   final List<ReportPhotoData> photos;
   final String location;
   final String title;
+  final String titleHe;
   final String templateKey;
   final List<String> attendees;
   final List<String> distributionList;
@@ -630,6 +698,7 @@ class ApiClient {
       photos: photos.map(ReportPhotoData.fromJson).toList(),
       location: session["location"]?.toString() ?? "",
       title: session["title"]?.toString() ?? "",
+      titleHe: session["title_he"]?.toString() ?? session["title"]?.toString() ?? "",
       templateKey: session["template_key"]?.toString() ?? "",
       attendees: (session["attendees"] as List? ?? []).map((e) => e.toString()).toList(),
       distributionList:
@@ -790,6 +859,16 @@ class ApiClient {
     if (resp.statusCode != 200) {
       throw Exception(resp.body);
     }
+  }
+
+  Future<void> sendDebugLog(String event, Map<String, dynamic> data) async {
+    try {
+      await http.post(
+        Uri.parse("$apiBaseUrl/debug/log"),
+        headers: _headers(),
+        body: jsonEncode({"event": event, "data": data}),
+      );
+    } catch (_) {}
   }
 
   Map<String, String> _headers({bool json = true}) {
@@ -1145,7 +1224,9 @@ class _StartReportScreenState extends State<StartReportScreen> {
               builder: (_) => ContactsScreen(
                 initialLocation: existing.location,
                 templateKey: existing.templateKey,
-                templateTitle: existing.title,
+                templateTitle: appLocale.value.languageCode == "he"
+                    ? existing.titleHe
+                    : existing.title,
               ),
             ),
           );
@@ -1156,9 +1237,10 @@ class _StartReportScreenState extends State<StartReportScreen> {
         setState(() => error = t(context, "error_no_template"));
         return;
       }
-      final templateTitle = templates
-          .firstWhere((t) => t.key == selectedTemplateKey, orElse: () => templates.first)
-          .title;
+      final template = templates.firstWhere((t) => t.key == selectedTemplateKey,
+          orElse: () => templates.first);
+      final templateTitle =
+          appLocale.value.languageCode == "he" ? template.titleHe : template.title;
       await HistoryStore.addValue(
         "history_locations",
         locationController.text,
@@ -1237,7 +1319,9 @@ class _StartReportScreenState extends State<StartReportScreen> {
                           value: t.key,
                           enabled: t.key == "INSPECTION_REPORT",
                           child: Text(
-                            t.title,
+                            appLocale.value.languageCode == "he"
+                                ? t.titleHe
+                                : t.title,
                             style: t.key == "INSPECTION_REPORT"
                                 ? null
                                 : TextStyle(color: Theme.of(context).disabledColor),
@@ -1667,7 +1751,9 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
           MaterialPageRoute(
             builder: (_) => AddItemScreen(
               location: report.location,
-              templateTitle: report.title,
+              templateTitle: appLocale.value.languageCode == "he"
+                  ? report.titleHe
+                  : report.title,
             ),
           ),
         );
@@ -1753,7 +1839,9 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
                     ];
                     return Card(
                       child: ListTile(
-                        title: Text(r.title),
+                        title: Text(appLocale.value.languageCode == "he"
+                            ? r.titleHe
+                            : r.title),
                         subtitle: Text(subtitleParts.join(" • ")),
                         trailing: Wrap(
                           spacing: 8,
@@ -1802,19 +1890,17 @@ class _AddItemScreenState extends State<AddItemScreen> {
   String? activeItemId;
   String? error;
   final stt.SpeechToText speech = stt.SpeechToText();
-  final AudioRecorder audioRecorder = AudioRecorder();
   bool isRecording = false;
   String lastTranscript = "";
+  double soundLevel = 0.0;
   String? recordingItemId;
   String? recordingField;
-  String? lastRecordingPath;
   List<String> descriptionHistory = [];
   List<String> notesHistory = [];
   List<ReportItemData> existingItems = [];
   String? editingItemId;
   String? speechLocaleId;
   Map<String, List<ReportPhotoData>> itemPhotos = {};
-  Map<String, String> itemAudioPaths = {};
   String? sessionLocation;
   String? sessionTitle;
   bool _initialItemCreated = false;
@@ -1828,7 +1914,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
 
   @override
   void dispose() {
-    audioRecorder.dispose();
     descriptionController.dispose();
     descriptionFocus.dispose();
     notesController.dispose();
@@ -1858,7 +1943,7 @@ class _AddItemScreenState extends State<AddItemScreen> {
           existingItems = session.items;
           itemPhotos = grouped;
           sessionLocation = session.location;
-          sessionTitle = session.title;
+          sessionTitle = appLocale.value.languageCode == "he" ? session.titleHe : session.title;
           if (activeItemId != null && session.items.every((item) => item.id != activeItemId)) {
             activeItemId = null;
           }
@@ -1893,7 +1978,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
         descriptionController.clear();
         notesController.clear();
         lastTranscript = "";
-        lastRecordingPath = null;
       });
       await _loadExistingItems();
     } catch (e) {
@@ -1905,13 +1989,45 @@ class _AddItemScreenState extends State<AddItemScreen> {
     try {
       final lang = Localizations.localeOf(context).languageCode.toLowerCase();
       final locales = await speech.locales();
+      api.sendDebugLog("RESOLVE_LOCALE_START", {
+        "current_lang": lang,
+        "device_locales": locales.map((l) => "${l.localeId}:${l.name}").toList()
+      });
       if (locales.isEmpty) return null;
-      final match = locales.firstWhere(
-        (l) => l.localeId.toLowerCase().startsWith(lang),
-        orElse: () => locales.first,
-      );
-      return match.localeId;
-    } catch (_) {
+
+      // 1. Try exact match for language code (e.g. "he" or "he-IL")
+      for (final l in locales) {
+        final id = l.localeId.toLowerCase();
+        if (id == lang || id == "${lang}_il" || id == "${lang}-il") {
+          api.sendDebugLog("RESOLVE_LOCALE_EXACT_MATCH", {"id": l.localeId});
+          return l.localeId;
+        }
+      }
+
+      // 2. Try prefix match
+      final match = locales.where((l) => l.localeId.toLowerCase().startsWith(lang)).toList();
+      if (match.isNotEmpty) {
+        api.sendDebugLog("RESOLVE_LOCALE_PREFIX_MATCH", {"id": match.first.localeId});
+        return match.first.localeId;
+      }
+
+      // 3. Special case for Hebrew (some devices use legacy "iw")
+      if (lang == "he") {
+        final hebrewMatch = locales.where((l) {
+          final id = l.localeId.toLowerCase();
+          return id.startsWith("he") || id.startsWith("iw");
+        }).toList();
+        if (hebrewMatch.isNotEmpty) {
+          api.sendDebugLog("RESOLVE_LOCALE_HEBREW_MATCH", {"id": hebrewMatch.first.localeId});
+          return hebrewMatch.first.localeId;
+        }
+        api.sendDebugLog("RESOLVE_LOCALE_HEBREW_MISSING", {"available": locales.length});
+        return null;
+      }
+
+      return locales.first.localeId;
+    } catch (e) {
+      api.sendDebugLog("RESOLVE_LOCALE_EXCEPTION", {"error": e.toString()});
       return null;
     }
   }
@@ -1961,49 +2077,10 @@ class _AddItemScreenState extends State<AddItemScreen> {
     } catch (_) {}
   }
 
-  Future<void> _startAudioBackup() async {
-    if (kIsWeb) return;
-    try {
-      // Android emulator/device path maps to: /data/data/<package>/app_flutter/...
-      final dir = await getApplicationDocumentsDirectory();
-      final recordingsDir = Directory("${dir.path}/recordings");
-      if (!await recordingsDir.exists()) {
-        await recordingsDir.create(recursive: true);
-      }
-      final filename = "recording_${DateTime.now().millisecondsSinceEpoch}.m4a";
-      final path = "${recordingsDir.path}/$filename";
-      final hasPerm = await audioRecorder.hasPermission();
-      if (!hasPerm) return;
-      await audioRecorder.start(
-        RecordConfig(
-          encoder: AudioEncoder.aacLc,
-          sampleRate: 16000,
-          numChannels: 1,
-          androidConfig: AndroidRecordConfig(audioSource: AndroidAudioSource.mic),
-        ),
-        path: path,
-      );
-      setState(() => lastRecordingPath = null);
-    } catch (_) {}
-  }
-
-  Future<String?> _stopAudioBackup() async {
-    if (kIsWeb) return null;
-    try {
-      final path = await audioRecorder.stop();
-      if (path != null && mounted) {
-        setState(() => lastRecordingPath = path);
-      }
-      return path;
-    } catch (_) {}
-    return null;
-  }
-
   Widget _buildAttachments() {
     if (activeItemId == null) return const SizedBox.shrink();
     final photos = itemPhotos[activeItemId] ?? [];
-    final audioPath = itemAudioPaths[activeItemId];
-    if (photos.isEmpty && audioPath == null) {
+    if (photos.isEmpty) {
       return const SizedBox.shrink();
     }
     final headers = api.token != null ? {"Authorization": "Bearer ${api.token}"} : <String, String>{};
@@ -2044,14 +2121,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
                 );
               },
             ),
-          ),
-        ],
-        if (audioPath != null) ...[
-          const SizedBox(height: 6),
-          OutlinedButton.icon(
-            onPressed: () => OpenFilex.open(audioPath),
-            icon: const Icon(Icons.play_arrow),
-            label: Text(t(context, "attached_audio_label")),
           ),
         ],
       ],
@@ -2215,7 +2284,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
           descriptionController.clear();
           notesController.clear();
           lastTranscript = "";
-          lastRecordingPath = null;
         });
         await _loadExistingItems();
         return;
@@ -2230,7 +2298,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
         descriptionController.clear();
         notesController.clear();
         lastTranscript = "";
-        lastRecordingPath = null;
       });
       await _loadExistingItems();
     } catch (e) {
@@ -2455,71 +2522,115 @@ class _AddItemScreenState extends State<AddItemScreen> {
   Future<void> _toggleRecording({String? targetItemId, String? targetField}) async {
     try {
       if (!isRecording) {
+        if (error != null) {
+          setState(() => error = null);
+        }
+        api.sendDebugLog("STT_START_ATTEMPT", {"field": targetField});
         final micOk = await Permission.microphone.request();
+        api.sendDebugLog("MIC_PERMISSION", {"granted": micOk.isGranted});
         if (!micOk.isGranted) {
           setState(() => error = t(context, "transcription_error"));
           return;
         }
-        await _startAudioBackup();
+
         final available = await speech.initialize(
+          onStatus: (status) {
+            debugPrint("STT Status: $status");
+            api.sendDebugLog("STT_STATUS", {"status": status});
+          },
           onError: (err) {
+            debugPrint("STT Error: ${err.errorMsg}");
+            api.sendDebugLog("STT_ERROR", {"msg": err.errorMsg, "permanent": err.permanent});
             if (mounted) {
-              setState(() => error = "${t(context, "transcription_error")} (${err.errorMsg})");
+              setState(() => error = t(context, "transcription_error"));
             }
           },
+          debugLogging: true,
         );
+
+        api.sendDebugLog("STT_INITIALIZED", {"available": available});
         if (!available) {
-          setState(() => error = t(context, "transcription_error"));
+          setState(() => error = t(context, "speech_not_available"));
           return;
         }
-        speechLocaleId ??= await _resolveSpeechLocale();
+
+        speechLocaleId = await _resolveSpeechLocale();
+        api.sendDebugLog("STT_LOCALE", {"locale": speechLocaleId});
+        if (speechLocaleId == null) {
+          setState(() => error = t(context, "speech_not_available"));
+          return;
+        }
+
         setState(() {
           isRecording = true;
           lastTranscript = "";
           recordingItemId = targetItemId;
           recordingField = targetField;
         });
+
         await speech.listen(
-          localeId: speechLocaleId,
-          listenMode: stt.ListenMode.dictation,
-          partialResults: true,
+          localeId: speechLocaleId!,
           onResult: (result) {
-            setState(() {
-              lastTranscript = result.recognizedWords;
-              if (recordingItemId == null) {
-                if (recordingField == "description") {
-                  descriptionController.text = lastTranscript;
-                  descriptionController.selection = TextSelection.fromPosition(
-                    TextPosition(offset: descriptionController.text.length),
-                  );
-                } else {
-                  notesController.text = lastTranscript;
-                  notesController.selection = TextSelection.fromPosition(
-                    TextPosition(offset: notesController.text.length),
-                  );
-                }
-              }
+            api.sendDebugLog("STT_RESULT", {
+              "words": result.recognizedWords,
+              "final": result.finalResult,
+              "confidence": result.confidence
             });
+            if (mounted) {
+              setState(() {
+                lastTranscript = result.recognizedWords;
+                if (recordingItemId == null) {
+                  if (recordingField == "description") {
+                    descriptionController.text = lastTranscript;
+                    descriptionController.selection = TextSelection.fromPosition(
+                      TextPosition(offset: descriptionController.text.length),
+                    );
+                  } else {
+                    notesController.text = lastTranscript;
+                    notesController.selection = TextSelection.fromPosition(
+                      TextPosition(offset: notesController.text.length),
+                    );
+                  }
+                }
+              });
+            }
           },
+          onSoundLevelChange: (level) {
+            if (mounted) setState(() => soundLevel = level);
+          },
+          cancelOnError: false,
+          partialResults: true,
+          listenMode: stt.ListenMode.dictation,
+          listenFor: const Duration(seconds: 30),
+          pauseFor: const Duration(seconds: 10),
         );
       } else {
+        api.sendDebugLog("STT_STOP_REQUEST", {});
         await speech.stop();
-        final audioPath = await _stopAudioBackup();
         final target = recordingItemId;
-        setState(() {
-          isRecording = false;
-          recordingItemId = null;
-          recordingField = null;
-        });
+        if (mounted) {
+          setState(() {
+            isRecording = false;
+            recordingItemId = null;
+            recordingField = null;
+          });
+        }
         if (target != null && lastTranscript.isNotEmpty) {
           await _applyTranscriptToItem(target, lastTranscript);
         }
-        if (target != null && audioPath != null) {
-          setState(() => itemAudioPaths[target] = audioPath);
+        if (mounted) {
+          setState(() => soundLevel = 0.0);
         }
       }
-    } catch (_) {
-      setState(() => error = t(context, "transcription_error"));
+    } catch (e) {
+      debugPrint("Toggle recording error: $e");
+      api.sendDebugLog("TOGGLE_RECORDING_EXCEPTION", {"error": e.toString()});
+      if (mounted) {
+        setState(() {
+          isRecording = false;
+          error = t(context, "transcription_error");
+        });
+      }
     }
   }
 
@@ -2593,6 +2704,9 @@ class _AddItemScreenState extends State<AddItemScreen> {
                   minLines: 3,
                   maxLines: null,
                   decoration: InputDecoration(labelText: t(context, "description_label")),
+                  onChanged: (_) {
+                    if (error != null) setState(() => error = null);
+                  },
                 );
               },
             ),
@@ -2621,6 +2735,17 @@ class _AddItemScreenState extends State<AddItemScreen> {
                       ? null
                       : () => _toggleRecording(targetField: "description"),
                 ),
+                if (isRecording && recordingField == "description")
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: LinearProgressIndicator(
+                        value: (soundLevel + 2) / 15, // Normalize rmsDB to 0.0-1.0
+                        backgroundColor: Colors.grey[200],
+                        valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
+                      ),
+                    ),
+                  ),
               ],
             ),
             Autocomplete<String>(
@@ -2649,6 +2774,9 @@ class _AddItemScreenState extends State<AddItemScreen> {
                   minLines: 3,
                   maxLines: null,
                   decoration: InputDecoration(labelText: t(context, "notes_label")),
+                  onChanged: (_) {
+                    if (error != null) setState(() => error = null);
+                  },
                 );
               },
             ),
@@ -2677,51 +2805,25 @@ class _AddItemScreenState extends State<AddItemScreen> {
                       ? null
                       : () => _toggleRecording(targetField: "notes"),
                 ),
+                if (isRecording && recordingField == "notes")
+                  Expanded(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: LinearProgressIndicator(
+                        value: (soundLevel + 2) / 15, // Normalize rmsDB to 0.0-1.0
+                        backgroundColor: Colors.grey[200],
+                        valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
+                      ),
+                    ),
+                  ),
               ],
             ),
             _buildAttachments(),
             const SizedBox(height: 12),
-            Row(
-              children: [
-                Expanded(
-                  child: Tooltip(
-                    message: t(context, "take_photo_button"),
-                    child: ElevatedButton(
-                      onPressed: _takePhoto,
-                      child: const Icon(Icons.photo_camera),
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Tooltip(
-                    message: t(context, "upload_photo_button"),
-                    child: OutlinedButton(
-                      onPressed: _uploadPhoto,
-                      child: const Icon(Icons.photo_library),
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => _toggleRecording(),
-              child: Icon(isRecording ? Icons.stop : Icons.mic),
-            ),
             if (lastTranscript.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 8),
                 child: Text("${t(context, "transcription_label")}: $lastTranscript"),
-              ),
-            if (lastRecordingPath != null)
-              Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: OutlinedButton.icon(
-                  onPressed: () => OpenFilex.open(lastRecordingPath!),
-                  icon: const Icon(Icons.play_arrow),
-                  label: Text(t(context, "audio_saved_label")),
-                ),
               ),
             const SizedBox(height: 12),
             ElevatedButton(onPressed: _addItem, child: Text(t(context, "add_item_button"))),
