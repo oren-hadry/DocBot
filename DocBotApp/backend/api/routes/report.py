@@ -17,6 +17,7 @@ from data.audit_log import log_event
 from data.stats import stats_manager
 from data.storage import user_temp_dir
 from data.word_generator import generate_report_docx
+from data.voice_transcriber import transcribe_audio
 
 router = APIRouter()
 logger = logging.getLogger("docbot.report")
@@ -25,6 +26,7 @@ logger = logging.getLogger("docbot.report")
 class StartReportRequest(BaseModel):
     location: Optional[str] = None
     template_key: Optional[str] = None
+    project_name: Optional[str] = None
 
 
 class AddItemRequest(BaseModel):
@@ -54,6 +56,7 @@ def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
         user.user_id,
         location=payload.location or "",
         template_key=payload.template_key or "",
+        project_name=payload.project_name or "",
     )
     if payload.location:
         locations_manager.add_location(user.user_id, payload.location)
@@ -61,7 +64,11 @@ def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
     log_event(
         user.user_id,
         "START_REPORT",
-        {"location": session.location, "template_key": session.template_key},
+        {
+            "location": session.location,
+            "template_key": session.template_key,
+            "project_name": session.project_name,
+        },
     )
     return {"status": "ok"}
 
@@ -200,8 +207,42 @@ async def add_photo(
     return {"status": "ok"}
 
 
+@router.post("/transcribe")
+async def transcribe(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+    user=Depends(get_current_user),
+):
+    if language:
+        language = language.lower()
+        if language == "iw":
+            language = "he"
+    suffix = Path(file.filename or "audio.m4a").suffix or ".m4a"
+    audio_path = user_temp_dir(user.user_id) / f"audio_{uuid4().hex}{suffix}"
+    content = await file.read()
+    with open(audio_path, "wb") as f:
+        f.write(content)
+    try:
+        text = transcribe_audio(str(audio_path), language=language)
+    finally:
+        try:
+            audio_path.unlink()
+        except Exception:
+            pass
+    log_event(
+        user.user_id,
+        "TRANSCRIBE_AUDIO",
+        {"language": language or "", "bytes": len(content)},
+    )
+    return {"text": text}
+
+
 @router.post("/finalize")
-def finalize_report(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+async def finalize_report(
+    background_tasks: BackgroundTasks,
+    logo: Optional[UploadFile] = File(None),
+    user=Depends(get_current_user),
+):
     session = report_manager.get_session(user.user_id)
     if not session:
         logger.warning("Finalize failed: no active report for user_id=%s", user.user_id)
@@ -209,8 +250,27 @@ def finalize_report(background_tasks: BackgroundTasks, user=Depends(get_current_
     if not session.items:
         logger.info("Finalize with empty report: user_id=%s", user.user_id)
 
+    logo_path = None
+    if logo:
+        suffix = Path(logo.filename or "logo.png").suffix or ".png"
+        logo_path = user_temp_dir(user.user_id) / f"logo_{uuid4().hex}{suffix}"
+        content = await logo.read()
+        with open(logo_path, "wb") as f:
+            f.write(content)
+
     session = report_manager.finalize(user.user_id)
-    doc_path = generate_report_docx(session)
+    
+    # Use profile logo if no logo provided in request
+    final_logo_path = str(logo_path) if logo_path else user.logo_path
+    
+    doc_path = generate_report_docx(session, logo_path=final_logo_path)
+
+    if logo_path:
+        try:
+            logo_path.unlink()
+        except Exception:
+            pass
+
     report_store.save_report(user.user_id, session, doc_path)
     stats_manager.increment(user.user_id, "reports_created")
 
@@ -220,6 +280,52 @@ def finalize_report(background_tasks: BackgroundTasks, user=Depends(get_current_
         path=doc_path,
         filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+
+@router.post("/finalize_pdf")
+async def finalize_report_pdf(
+    background_tasks: BackgroundTasks,
+    logo: Optional[UploadFile] = File(None),
+    user=Depends(get_current_user),
+):
+    session = report_manager.get_session(user.user_id)
+    if not session:
+        raise HTTPException(status_code=400, detail="No active report")
+
+    logo_path = None
+    if logo:
+        suffix = Path(logo.filename or "logo.png").suffix or ".png"
+        logo_path = user_temp_dir(user.user_id) / f"logo_{uuid4().hex}{suffix}"
+        content = await logo.read()
+        with open(logo_path, "wb") as f:
+            f.write(content)
+
+    session = report_manager.finalize(user.user_id)
+    # Use profile logo if no logo provided in request
+    final_logo_path = str(logo_path) if logo_path else user.logo_path
+
+    # For now, we still generate DOCX and then we would ideally convert to PDF.
+    # Since direct DOCX->PDF is hard without external tools, 
+    # I will implement a basic PDF generator using fpdf2 for Hebrew support.
+    from data.pdf_generator import generate_report_pdf
+    pdf_path = generate_report_pdf(session, logo_path=final_logo_path)
+
+    if logo_path:
+        try:
+            logo_path.unlink()
+        except Exception:
+            pass
+
+    report_store.save_report(user.user_id, session, pdf_path)
+    stats_manager.increment(user.user_id, "reports_created")
+
+    filename = os.path.basename(pdf_path)
+    log_event(user.user_id, "FINALIZE_REPORT_PDF", {"doc": filename})
+    return FileResponse(
+        path=pdf_path,
+        filename=filename,
+        media_type="application/pdf",
     )
 
 
@@ -238,7 +344,7 @@ def open_report(report_id: str, user=Depends(get_current_user)):
     data = report_store.get_report_data(user.user_id, report_id)
     if not data:
         raise HTTPException(status_code=404, detail="Report not found")
-    report_manager.load_from_report(data)
+    report_manager.load_from_report(user.user_id, data)
     log_event(user.user_id, "OPEN_REPORT", {"report_id": report_id})
     return {"status": "ok"}
 

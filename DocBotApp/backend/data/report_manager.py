@@ -33,6 +33,7 @@ class ReportSession:
     title: str = "Inspection Report"
     title_he: str = "דוח פיקוח"
     template_key: str = "INSPECTION_REPORT"
+    project_name: str = ""
     attendees: list[str] = field(default_factory=list)
     distribution_list: list[str] = field(default_factory=list)
     items: list[ReportItem] = field(default_factory=list)
@@ -49,6 +50,7 @@ class ReportSession:
             "title": self.title,
             "title_he": self.title_he,
             "template_key": self.template_key,
+            "project_name": self.project_name,
             "attendees": self.attendees,
             "distribution_list": self.distribution_list,
             "items": [asdict(i) for i in self.items],
@@ -64,6 +66,7 @@ class ReportSession:
             title=data.get("title", "Inspection Report"),
             title_he=data.get("title_he", "דוח פיקוח"),
             template_key=data.get("template_key", "INSPECTION_REPORT"),
+            project_name=data.get("project_name", ""),
             attendees=data.get("attendees", []),
             distribution_list=data.get("distribution_list", []),
         )
@@ -76,7 +79,7 @@ class ReportManager:
     def __init__(self):
         self._sessions: dict[int, ReportSession] = {}
 
-    def create_session(self, user_id: int, location: str = "", template_key: str = "") -> ReportSession:
+    def create_session(self, user_id: int, location: str = "", template_key: str = "", project_name: str = "") -> ReportSession:
         template = get_template(template_key) if template_key else get_template("INSPECTION_REPORT")
         session = ReportSession(
             user_id=user_id,
@@ -84,6 +87,7 @@ class ReportManager:
             template_key=template.key,
             title=template.title,
             title_he=template.title_he,
+            project_name=project_name.strip(),
         )
         self._sessions[user_id] = session
         self._save_session(session)
@@ -103,7 +107,9 @@ class ReportManager:
         return None
 
     def add_item(self, user_id: int, description: str, notes: str = "") -> ReportItem:
-        session = self._sessions[user_id]
+        session = self.get_session(user_id)
+        if not session:
+            raise ValueError("No active report")
         item = ReportItem(
             id=uuid4().hex,
             number=session.next_number(),
@@ -115,7 +121,9 @@ class ReportManager:
         return item
 
     def add_photo(self, user_id: int, file_path: str, item_id: Optional[str]) -> ReportPhoto:
-        session = self._sessions[user_id]
+        session = self.get_session(user_id)
+        if not session:
+            raise ValueError("No active report")
         photo = ReportPhoto(
             id=uuid4().hex,
             file_path=file_path,
@@ -145,9 +153,10 @@ class ReportManager:
                 return
         raise ValueError("Item not found")
 
-    def load_from_report(self, session_data: dict) -> ReportSession:
+    def load_from_report(self, user_id: int, session_data: dict) -> ReportSession:
         session = ReportSession.from_dict(session_data)
-        self._sessions[session.user_id] = session
+        session.user_id = user_id
+        self._sessions[user_id] = session
         self._save_session(session)
         return session
 
@@ -157,7 +166,10 @@ class ReportManager:
             json.dump(session.to_dict(), f, ensure_ascii=False, indent=2)
 
     def finalize(self, user_id: int) -> ReportSession:
-        session = self._sessions.pop(user_id)
+        session = self.get_session(user_id)
+        if not session:
+            raise ValueError("No active report")
+        self._sessions.pop(user_id, None)
         path = user_session_file(user_id)
         if path.exists():
             path.unlink()

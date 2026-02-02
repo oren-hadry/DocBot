@@ -2,8 +2,10 @@ import logging
 import time
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pathlib import Path
 
 from api.auth import (
     RegisterRequest,
@@ -17,6 +19,7 @@ from api.auth import (
     is_login_locked,
     record_login_failure,
     clear_login_failures,
+    ProfileUpdateRequest,
 )
 from api.routes import report, contacts
 from data.user_auth import user_auth
@@ -148,7 +151,75 @@ def get_me(user=Depends(get_current_user)):
         "phone": user.phone,
         "email": user.email,
         "verified": user.verified,
+        "full_name": user.full_name,
+        "role_title": user.role_title,
+        "phone_contact": user.phone_contact,
+        "company_name": user.company_name,
+        "signature_path": user.signature_path,
+        "logo_path": user.logo_path,
     }
+
+
+@app.put("/auth/profile")
+def update_profile(payload: ProfileUpdateRequest, user=Depends(get_current_user)):
+    updated = user_auth.update_profile(
+        user.user_id,
+        full_name=payload.full_name,
+        role_title=payload.role_title,
+        phone_contact=payload.phone_contact,
+        company_name=payload.company_name,
+        signature_path=payload.signature_path,
+        logo_path=payload.logo_path,
+    )
+    log_event(user.user_id, "UPDATE_PROFILE", {})
+    return {
+        "full_name": updated.full_name,
+        "role_title": updated.role_title,
+        "phone_contact": updated.phone_contact,
+        "company_name": updated.company_name,
+        "signature_path": updated.signature_path,
+        "logo_path": updated.logo_path,
+    }
+
+
+@app.post("/auth/signature")
+async def upload_signature(file: UploadFile = File(...), user=Depends(get_current_user)):
+    from data.storage import user_dir
+    suffix = Path(file.filename or "signature.png").suffix or ".png"
+    sig_path = user_dir(user.user_id) / f"signature{suffix}"
+    content = await file.read()
+    with open(sig_path, "wb") as f:
+        f.write(content)
+    user_auth.update_profile(user.user_id, signature_path=str(sig_path))
+    log_event(user.user_id, "UPLOAD_SIGNATURE", {"path": sig_path.name})
+    return {"status": "ok", "path": str(sig_path)}
+
+
+@app.get("/auth/signature")
+def get_signature(user=Depends(get_current_user)):
+    if not user.signature_path or not Path(user.signature_path).exists():
+        raise HTTPException(status_code=404, detail="Signature not found")
+    return FileResponse(user.signature_path)
+
+
+@app.post("/auth/logo")
+async def upload_profile_logo(file: UploadFile = File(...), user=Depends(get_current_user)):
+    from data.storage import user_dir
+    suffix = Path(file.filename or "logo.png").suffix or ".png"
+    logo_path = user_dir(user.user_id) / f"profile_logo{suffix}"
+    content = await file.read()
+    with open(logo_path, "wb") as f:
+        f.write(content)
+    user_auth.update_profile(user.user_id, logo_path=str(logo_path))
+    log_event(user.user_id, "UPLOAD_PROFILE_LOGO", {"path": logo_path.name})
+    return {"status": "ok", "path": str(logo_path)}
+
+
+@app.get("/auth/logo")
+def get_profile_logo(user=Depends(get_current_user)):
+    if not user.logo_path or not Path(user.logo_path).exists():
+        raise HTTPException(status_code=404, detail="Profile logo not found")
+    return FileResponse(user.logo_path)
 
 
 app.include_router(report.router, prefix="/reports", tags=["reports"])

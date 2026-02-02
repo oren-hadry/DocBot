@@ -103,6 +103,15 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
+class ProfileUpdateRequest(BaseModel):
+    full_name: Optional[str] = None
+    role_title: Optional[str] = None
+    phone_contact: Optional[str] = None
+    company_name: Optional[str] = None
+    signature_path: Optional[str] = None
+    logo_path: Optional[str] = None
+
+
 def create_access_token(user: UserRecord, expires_minutes: Optional[int] = None) -> str:
     expire = datetime.utcnow() + timedelta(minutes=expires_minutes or config.API_TOKEN_EXPIRE_MINUTES)
     payload = {"sub": str(user.user_id), "phone": user.phone, "exp": expire}

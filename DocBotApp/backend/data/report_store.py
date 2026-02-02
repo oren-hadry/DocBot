@@ -19,6 +19,7 @@ class ReportSummary:
     title: str
     title_he: str = ""
     folder: str = ""
+    project_name: str = ""
     tags: list[str] = None
 
     def to_dict(self) -> dict:
@@ -72,6 +73,7 @@ class ReportStore:
             title=session.title,
             title_he=session.title_he,
             folder="",
+            project_name=session.project_name,
             tags=[],
         )
         self._append_summary(user_id, summary)

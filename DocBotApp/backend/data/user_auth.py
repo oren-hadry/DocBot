@@ -26,6 +26,12 @@ class UserRecord:
     verified: bool = False
     verification_code_hash: Optional[str] = None
     verification_expires_at: Optional[str] = None
+    full_name: Optional[str] = None
+    role_title: Optional[str] = None
+    phone_contact: Optional[str] = None
+    company_name: Optional[str] = None
+    signature_path: Optional[str] = None
+    logo_path: Optional[str] = None
 
 
 class UserAuthManager:
@@ -52,6 +58,12 @@ class UserAuthManager:
                         verified=u.get("verified", False),
                         verification_code_hash=u.get("verification_code_hash"),
                         verification_expires_at=u.get("verification_expires_at"),
+                        full_name=u.get("full_name"),
+                        role_title=u.get("role_title"),
+                        phone_contact=u.get("phone_contact"),
+                        company_name=u.get("company_name"),
+                        signature_path=u.get("signature_path"),
+                        logo_path=u.get("logo_path"),
                     )
                 self._cache = normalized
                 return self._cache
@@ -139,6 +151,39 @@ class UserAuthManager:
         user.verification_code_hash = None
         user.verification_expires_at = None
         users[phone] = user
+        self._save_all(users)
+        return user
+
+    def update_profile(
+        self,
+        user_id: int,
+        full_name: Optional[str] = None,
+        role_title: Optional[str] = None,
+        phone_contact: Optional[str] = None,
+        company_name: Optional[str] = None,
+        signature_path: Optional[str] = None,
+        logo_path: Optional[str] = None,
+    ) -> UserRecord:
+        users = self._load_all()
+        user = None
+        for u in users.values():
+            if u.user_id == user_id:
+                user = u
+                break
+        if not user:
+            raise ValueError("User not found")
+        if full_name is not None:
+            user.full_name = full_name
+        if role_title is not None:
+            user.role_title = role_title
+        if phone_contact is not None:
+            user.phone_contact = phone_contact
+        if company_name is not None:
+            user.company_name = company_name
+        if signature_path is not None:
+            user.signature_path = signature_path
+        if logo_path is not None:
+            user.logo_path = logo_path
         self._save_all(users)
         return user
 

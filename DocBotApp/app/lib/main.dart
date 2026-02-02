@@ -1,3 +1,4 @@
+import "dart:async";
 import "dart:convert";
 import "dart:io";
 import "dart:typed_data";
@@ -15,12 +16,16 @@ import "package:shared_preferences/shared_preferences.dart";
 import "package:permission_handler/permission_handler.dart";
 import "package:flutter_contacts/flutter_contacts.dart";
 import "package:url_launcher/url_launcher.dart";
+import "package:record/record.dart";
 import "package:photo_manager/photo_manager.dart";
 import "package:in_app_update/in_app_update.dart";
 import "package:package_info_plus/package_info_plus.dart";
 import "package:flutter/services.dart";
 import "package:flutter_secure_storage/flutter_secure_storage.dart";
 import "package:crypto/crypto.dart";
+import "package:geolocator/geolocator.dart";
+import "package:geocoding/geocoding.dart";
+import "package:image_painter/image_painter.dart";
 import "l10n/strings.dart";
 import "local/history_store.dart";
 
@@ -50,6 +55,7 @@ final String apiBaseUrl = resolveApiBaseUrl();
 final ValueNotifier<Locale> appLocale = ValueNotifier(const Locale("he", "IL"));
 final ValueNotifier<bool> isLoggedIn = ValueNotifier(false);
 final ValueNotifier<String?> currentUserKey = ValueNotifier(null);
+final ValueNotifier<String?> selectedLogoPath = ValueNotifier(null);
 const _secureStorage = FlutterSecureStorage();
 
 String _bytesToHex(Uint8List bytes) {
@@ -179,6 +185,8 @@ List<Widget> appBarActions(
       onSelected: (value) {
         if (value == "language") {
           toggleLocale();
+        } else if (value == "profile") {
+          Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ProfileScreen()));
         } else if (value == "cancel_report") {
           onSelected?.call(value);
         } else if (value == "logout") {
@@ -193,6 +201,10 @@ List<Widget> appBarActions(
       },
       itemBuilder: (context) {
         final items = <PopupMenuEntry<String>>[
+          PopupMenuItem<String>(
+            value: "profile",
+            child: Text(t(context, "profile_title")),
+          ),
           if (extraItems != null) ...extraItems,
           if (showCancelReport)
             PopupMenuItem<String>(
@@ -310,7 +322,21 @@ class DocBotApp extends StatelessWidget {
         final isRtl = locale.languageCode == "he";
         return MaterialApp(
           title: "DocBotApp",
-          theme: ThemeData(useMaterial3: true),
+          theme: ThemeData(
+            useMaterial3: true,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: Colors.blue,
+              brightness: Brightness.light,
+            ),
+          ),
+          darkTheme: ThemeData(
+            useMaterial3: true,
+            colorScheme: ColorScheme.fromSeed(
+              seedColor: Colors.blue,
+              brightness: Brightness.dark,
+            ),
+          ),
+          themeMode: ThemeMode.system,
           locale: locale,
           supportedLocales: const [Locale("he", "IL"), Locale("en", "US")],
           localizationsDelegates: const [
@@ -496,6 +522,7 @@ class ReportSummary {
     required this.title,
     required this.titleHe,
     required this.folder,
+    required this.projectName,
     required this.tags,
   });
 
@@ -506,6 +533,7 @@ class ReportSummary {
   final String title;
   final String titleHe;
   final String folder;
+  final String projectName;
   final List<String> tags;
 
   factory ReportSummary.fromJson(Map<String, dynamic> json) {
@@ -517,6 +545,7 @@ class ReportSummary {
       title: json["title"] ?? "",
       titleHe: json["title_he"] ?? json["title"] ?? "",
       folder: json["folder"] ?? "",
+      projectName: json["project_name"] ?? "",
       tags: (json["tags"] as List?)?.map((e) => e.toString()).toList() ?? [],
     );
   }
@@ -567,6 +596,7 @@ class ActiveSessionData {
     required this.title,
     required this.titleHe,
     required this.templateKey,
+    required this.projectName,
     required this.attendees,
     required this.distributionList,
   });
@@ -577,12 +607,28 @@ class ActiveSessionData {
   final String title;
   final String titleHe;
   final String templateKey;
+  final String projectName;
   final List<String> attendees;
   final List<String> distributionList;
 }
 
 class ApiClient {
   String? token;
+
+  dynamic _decodeJson(http.Response resp) {
+    return jsonDecode(utf8.decode(resp.bodyBytes));
+  }
+
+  Map<String, String> _headers({bool json = true}) {
+    final headers = <String, String>{};
+    if (token != null) {
+      headers["Authorization"] = "Bearer $token";
+    }
+    if (json) {
+      headers["Content-Type"] = "application/json";
+    }
+    return headers;
+  }
 
   Future<Map<String, dynamic>> getCurrentUser() async {
     final resp = await http.get(
@@ -595,25 +641,9 @@ class ApiClient {
     return _decodeJson(resp) as Map<String, dynamic>;
   }
 
-  dynamic _decodeJson(http.Response resp) {
-    return jsonDecode(utf8.decode(resp.bodyBytes));
-  }
-
   Future<String> login(String phone, String password) async {
     final resp = await http.post(
       Uri.parse("$apiBaseUrl/auth/login"),
-      headers: {"Content-Type": "application/json"},
-      body: jsonEncode({"phone": phone, "password": password}),
-    );
-    if (resp.statusCode != 200) {
-      throw Exception(resp.body);
-    }
-    return (_decodeJson(resp) as Map<String, dynamic>)["access_token"] as String;
-  }
-
-  Future<String> register(String phone, String password) async {
-    final resp = await http.post(
-      Uri.parse("$apiBaseUrl/auth/register"),
       headers: {"Content-Type": "application/json"},
       body: jsonEncode({"phone": phone, "password": password}),
     );
@@ -700,6 +730,7 @@ class ApiClient {
       title: session["title"]?.toString() ?? "",
       titleHe: session["title_he"]?.toString() ?? session["title"]?.toString() ?? "",
       templateKey: session["template_key"]?.toString() ?? "",
+      projectName: session["project_name"]?.toString() ?? "",
       attendees: (session["attendees"] as List? ?? []).map((e) => e.toString()).toList(),
       distributionList:
           (session["distribution_list"] as List? ?? []).map((e) => e.toString()).toList(),
@@ -728,11 +759,15 @@ class ApiClient {
     }
   }
 
-  Future<void> startReport(String location, String templateKey) async {
+  Future<void> startReport(String location, String templateKey, {String? projectName}) async {
     final resp = await http.post(
       Uri.parse("$apiBaseUrl/reports/start"),
       headers: _headers(),
-      body: jsonEncode({"location": location, "template_key": templateKey}),
+      body: jsonEncode({
+        "location": location,
+        "template_key": templateKey,
+        "project_name": projectName,
+      }),
     );
     if (resp.statusCode != 200) {
       throw Exception(resp.body);
@@ -834,18 +869,28 @@ class ApiClient {
     }
   }
 
-  Future<String> finalizeAndSave({String? filename}) async {
-    final resp = await http.post(
-      Uri.parse("$apiBaseUrl/reports/finalize"),
-      headers: _headers(json: false),
+  Future<String> finalizeAndSave({String? filename, File? logoFile, bool pdf = false}) async {
+    final endpoint = pdf ? "finalize_pdf" : "finalize";
+    final req = http.MultipartRequest(
+      "POST",
+      Uri.parse("$apiBaseUrl/reports/$endpoint"),
     );
+    req.headers.addAll(_headers(json: false));
+    if (logoFile != null) {
+      req.files.add(await http.MultipartFile.fromPath("logo", logoFile.path));
+    }
+
+    final streamed = await req.send();
+    final resp = await http.Response.fromStream(streamed);
+
     if (resp.statusCode != 200) {
       throw Exception(resp.body);
     }
     final dir = await getApplicationDocumentsDirectory();
-    final fallback = "Report_${DateTime.now().millisecondsSinceEpoch}.docx";
+    final ext = pdf ? ".pdf" : ".docx";
+    final fallback = "Report_${DateTime.now().millisecondsSinceEpoch}$ext";
     final name = (filename == null || filename.isEmpty) ? fallback : filename;
-    final finalName = name.endsWith(".docx") ? name : "$name.docx";
+    final finalName = name.endsWith(ext) ? name : "$name$ext";
     final file = File("${dir.path}/$finalName");
     await file.writeAsBytes(resp.bodyBytes);
     return file.path;
@@ -871,15 +916,86 @@ class ApiClient {
     } catch (_) {}
   }
 
-  Map<String, String> _headers({bool json = true}) {
-    final headers = <String, String>{};
-    if (token != null) {
-      headers["Authorization"] = "Bearer $token";
+  Future<String> transcribeAudio(File file, {String? language}) async {
+    final req = http.MultipartRequest(
+      "POST",
+      Uri.parse("$apiBaseUrl/reports/transcribe"),
+    );
+    req.headers.addAll(_headers(json: false));
+    if (language != null && language.isNotEmpty) {
+      req.fields["language"] = language;
     }
-    if (json) {
-      headers["Content-Type"] = "application/json";
+    req.files.add(await http.MultipartFile.fromPath("file", file.path));
+    final streamed = await req.send();
+    final body = await streamed.stream.bytesToString();
+    if (streamed.statusCode != 200) {
+      throw Exception(body);
     }
-    return headers;
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    return (data["text"] ?? "").toString();
+  }
+
+  Future<Map<String, dynamic>> getMe() async {
+    final resp = await http.get(Uri.parse("$apiBaseUrl/auth/me"), headers: _headers());
+    if (resp.statusCode != 200) throw Exception(resp.body);
+    return jsonDecode(resp.body);
+  }
+
+  Future<void> updateProfile({
+    String? fullName,
+    String? roleTitle,
+    String? phoneContact,
+    String? companyName,
+    String? signaturePath,
+  }) async {
+    final resp = await http.put(
+      Uri.parse("$apiBaseUrl/auth/profile"),
+      headers: _headers(),
+      body: jsonEncode({
+        "full_name": fullName,
+        "role_title": roleTitle,
+        "phone_contact": phoneContact,
+        "company_name": companyName,
+        "signature_path": signaturePath,
+      }),
+    );
+    if (resp.statusCode != 200) throw Exception(resp.body);
+  }
+
+  Future<void> uploadSignature(File file) async {
+    final req = http.MultipartRequest(
+      "POST",
+      Uri.parse("$apiBaseUrl/auth/signature"),
+    );
+    req.headers.addAll(_headers(json: false));
+    req.files.add(await http.MultipartFile.fromPath("file", file.path));
+    final streamed = await req.send();
+    if (streamed.statusCode != 200) {
+      final body = await streamed.stream.bytesToString();
+      throw Exception(body);
+    }
+  }
+
+  Future<void> uploadProfileLogo(File file) async {
+    final req = http.MultipartRequest(
+      "POST",
+      Uri.parse("$apiBaseUrl/auth/logo"),
+    );
+    req.headers.addAll(_headers(json: false));
+    req.files.add(await http.MultipartFile.fromPath("file", file.path));
+    final streamed = await req.send();
+    if (streamed.statusCode != 200) {
+      final body = await streamed.stream.bytesToString();
+      throw Exception(body);
+    }
+  }
+
+  String getSignatureUrl() {
+    return "$apiBaseUrl/auth/signature";
+  }
+
+  String getProfileLogoUrl() {
+    return "$apiBaseUrl/auth/logo";
   }
 }
 
@@ -944,9 +1060,6 @@ class _LoginScreenState extends State<LoginScreen> {
       try {
         final token = await api.login(phone, password);
         await _saveToken(token);
-        if (mounted) {
-          Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const StartReportScreen()));
-        }
         return;
       } catch (_) {
         setState(() => emailEditable = true);
@@ -1126,8 +1239,7 @@ class _LoginScreenState extends State<LoginScreen> {
               onPressed: loading ? null : _auth,
               child: Text(t(context, "login_button")),
             ),
-            const SizedBox(height: 24),
-            const Divider(),
+            const Spacer(),
             Text(
               "API: $apiBaseUrl",
               style: Theme.of(context).textTheme.bodySmall,
@@ -1135,13 +1247,13 @@ class _LoginScreenState extends State<LoginScreen> {
             const SizedBox(height: 8),
             OutlinedButton.icon(
               onPressed: _testConnection,
-              icon: const Icon(Icons.network_check),
-              label: const Text("Test Connection"),
+              icon: const Icon(Icons.network_check, size: 16),
+              label: const Text("Test Connection", style: TextStyle(fontSize: 12)),
             ),
             if (connectionStatus != null)
               Padding(
-                padding: const EdgeInsets.only(top: 6),
-                child: Text(connectionStatus!, style: Theme.of(context).textTheme.bodySmall),
+                padding: const EdgeInsets.only(top: 4, bottom: 8),
+                child: Text(connectionStatus!, style: Theme.of(context).textTheme.bodySmall?.copyWith(color: connectionStatus!.startsWith("OK") ? Colors.green : Colors.red)),
               ),
           ],
         ),
@@ -1159,18 +1271,89 @@ class StartReportScreen extends StatefulWidget {
 
 class _StartReportScreenState extends State<StartReportScreen> {
   final locationController = TextEditingController();
+  final projectController = TextEditingController();
   String? error;
   List<TemplateInfo> templates = [];
   String? selectedTemplateKey;
   List<String> recentLocations = [];
   List<String> locationHistory = [];
   bool loading = false;
+
+  List<String> logos = [];
+
   @override
   void initState() {
     super.initState();
     _loadTemplates();
     _loadLocations();
     _loadLocationHistory();
+    _loadLogos();
+  }
+
+  Future<void> _loadLogos() async {
+    final prefs = await SharedPreferences.getInstance();
+    final list = prefs.getStringList("user_logos") ?? [];
+    final selected = prefs.getString("selected_logo");
+    if (mounted) {
+      setState(() => logos = list);
+      selectedLogoPath.value = selected;
+    }
+  }
+
+  Future<void> _saveLogos() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList("user_logos", logos);
+    if (selectedLogoPath.value != null) {
+      await prefs.setString("selected_logo", selectedLogoPath.value!);
+    } else {
+      await prefs.remove("selected_logo");
+    }
+  }
+
+  Future<void> _pickLogo() async {
+    final picker = ImagePicker();
+    final picked = await picker.pickImage(source: ImageSource.gallery);
+    if (picked != null) {
+      setState(() {
+        if (!logos.contains(picked.path)) {
+          logos.add(picked.path);
+        }
+        selectedLogoPath.value = picked.path;
+      });
+      await _saveLogos();
+    }
+  }
+
+  Future<void> _detectLocation() async {
+    try {
+      bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) {
+        setState(() => error = t(context, "location_not_found"));
+        return;
+      }
+      LocationPermission permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+        if (permission == LocationPermission.denied) {
+          setState(() => error = t(context, "location_permission_denied"));
+          return;
+        }
+      }
+      if (permission == LocationPermission.deniedForever) {
+        setState(() => error = t(context, "location_permission_denied"));
+        return;
+      }
+
+      final pos = await Geolocator.getCurrentPosition();
+      final placemarks = await placemarkFromCoordinates(pos.latitude, pos.longitude);
+      if (placemarks.isNotEmpty) {
+        final p = placemarks.first;
+        final addr = "${p.street}, ${p.locality}, ${p.country}";
+        setState(() => locationController.text = addr);
+      }
+    } catch (e) {
+      setState(() => error = e.toString());
+    }
   }
 
   Future<void> _loadTemplates() async {
@@ -1246,7 +1429,11 @@ class _StartReportScreenState extends State<StartReportScreen> {
         locationController.text,
         userKey: currentUserKey.value,
       );
-      await api.startReport(locationController.text.trim(), selectedTemplateKey!);
+      await api.startReport(
+        locationController.text.trim(),
+        selectedTemplateKey!,
+        projectName: projectController.text.trim(),
+      );
       if (mounted) {
         Navigator.of(context).push(
           MaterialPageRoute(
@@ -1297,18 +1484,93 @@ class _StartReportScreenState extends State<StartReportScreen> {
                   focusNode: focusNode,
                   textDirection: _textDirection(context),
                   textAlign: _textAlign(context),
-                  decoration: InputDecoration(labelText: t(context, "location_label")),
+                  decoration: InputDecoration(
+                    labelText: t(context, "location_label"),
+                    suffixIcon: IconButton(
+                      icon: const Icon(Icons.my_location),
+                      tooltip: t(context, "detect_location_tooltip"),
+                      onPressed: () async {
+                        await _detectLocation();
+                        controller.text = locationController.text;
+                      },
+                    ),
+                  ),
                 );
               },
             ),
-            if (recentLocations.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text(
-                  "${t(context, "saved_locations_label")}: ${recentLocations.join(", ")}",
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: projectController,
+              decoration: InputDecoration(
+                labelText: t(context, "project_name_label"),
+                hintText: t(context, "project_name_hint"),
+                border: const OutlineInputBorder(),
               ),
+            ),
+            const SizedBox(height: 12),
+            ExpansionTile(
+              title: Text(t(context, "logo_selector_title")),
+              subtitle: ValueListenableBuilder<String?>(
+                valueListenable: selectedLogoPath,
+                builder: (context, path, _) => path != null 
+                  ? Text(path.split("/").last)
+                  : Text(t(context, "no_logos_yet")),
+              ),
+              children: [
+                if (logos.isNotEmpty)
+                  SizedBox(
+                    height: 100,
+                    child: ListView.builder(
+                      scrollDirection: Axis.horizontal,
+                      itemCount: logos.length,
+                      itemBuilder: (context, index) {
+                        final path = logos[index];
+                        return ValueListenableBuilder<String?>(
+                          valueListenable: selectedLogoPath,
+                          builder: (context, selectedPath, _) {
+                            final isSelected = selectedPath == path;
+                            return GestureDetector(
+                              onTap: () {
+                                selectedLogoPath.value = isSelected ? null : path;
+                                _saveLogos();
+                              },
+                              child: Container(
+                                margin: const EdgeInsets.symmetric(horizontal: 4),
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: isSelected ? Colors.blue : Colors.grey,
+                                    width: isSelected ? 3 : 1,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Stack(
+                                  children: [
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(5),
+                                      child: Image.file(File(path), width: 80, height: 80, fit: BoxFit.cover),
+                                    ),
+                                    if (isSelected)
+                                      const Positioned(
+                                        right: 2,
+                                        top: 2,
+                                        child: Icon(Icons.check_circle, color: Colors.blue, size: 20),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                ListTile(
+                  leading: const Icon(Icons.add_photo_alternate),
+                  title: Text(t(context, "pick_logo_button")),
+                  onTap: _pickLogo,
+                ),
+              ],
+            ),
             const SizedBox(height: 12),
             if (templates.isNotEmpty)
               DropdownButtonFormField<String>(
@@ -1718,25 +1980,68 @@ class RecentReportsScreen extends StatefulWidget {
 }
 
 class _RecentReportsScreenState extends State<RecentReportsScreen> {
-  List<ReportSummary> reports = [];
+  List<ReportSummary> allReports = [];
+  List<ReportSummary> filteredReports = [];
+  bool loading = true;
   String? error;
-  bool loading = false;
+  String searchQuery = "";
+  String groupingMode = "project"; // "none", "project", "folder"
 
   @override
   void initState() {
     super.initState();
-    _loadReports();
+    _load();
   }
 
-  Future<void> _loadReports() async {
+  Future<void> _load() async {
     try {
       final list = await api.listRecentReports();
       if (mounted) {
-        setState(() => reports = list);
+        setState(() {
+          allReports = list;
+          filteredReports = list;
+          loading = false;
+        });
       }
     } catch (e) {
-      setState(() => error = e.toString());
+      if (mounted) {
+        setState(() {
+          error = e.toString();
+          loading = false;
+        });
+      }
     }
+  }
+
+  void _search(String query) {
+    setState(() {
+      searchQuery = query;
+      if (query.isEmpty) {
+        filteredReports = allReports;
+      } else {
+        final q = query.toLowerCase();
+        filteredReports = allReports.where((r) {
+          return r.location.toLowerCase().contains(q) ||
+              r.projectName.toLowerCase().contains(q) ||
+              r.title.toLowerCase().contains(q) ||
+              r.titleHe.toLowerCase().contains(q);
+        }).toList();
+      }
+    });
+  }
+
+  Map<String, List<ReportSummary>> _getGroupedReports() {
+    final grouped = <String, List<ReportSummary>>{};
+    for (final r in filteredReports) {
+      String key;
+      if (groupingMode == "folder") {
+        key = r.folder.isEmpty ? t(context, "no_folders_yet") : r.folder;
+      } else {
+        key = r.projectName.isEmpty ? t(context, "no_projects_yet") : r.projectName;
+      }
+      grouped.putIfAbsent(key, () => []).add(r);
+    }
+    return grouped;
   }
 
   Future<void> _openForEdit(ReportSummary report) async {
@@ -1749,11 +2054,10 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
       if (mounted) {
         Navigator.of(context).push(
           MaterialPageRoute(
-            builder: (_) => AddItemScreen(
-              location: report.location,
-              templateTitle: appLocale.value.languageCode == "he"
-                  ? report.titleHe
-                  : report.title,
+            builder: (_) => ContactsScreen(
+              initialLocation: report.location,
+              templateKey: report.templateKey,
+              templateTitle: appLocale.value.languageCode == "he" ? report.titleHe : report.title,
             ),
           ),
         );
@@ -1768,6 +2072,12 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
   Future<void> _organize(ReportSummary report) async {
     final folderController = TextEditingController(text: report.folder);
     final tagsController = TextEditingController(text: report.tags.join(", "));
+    final existingFolders = allReports
+        .map((r) => r.folder)
+        .where((f) => f.isNotEmpty)
+        .toSet()
+        .toList();
+
     final result = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
@@ -1775,11 +2085,23 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
-              controller: folderController,
-              textDirection: _textDirection(context),
-              textAlign: _textAlign(context),
-              decoration: InputDecoration(labelText: t(context, "folder_label")),
+            Autocomplete<String>(
+              initialValue: TextEditingValue(text: report.folder),
+              optionsBuilder: (value) {
+                if (value.text.isEmpty) return existingFolders;
+                return existingFolders.where((f) => f.toLowerCase().contains(value.text.toLowerCase()));
+              },
+              onSelected: (val) => folderController.text = val,
+              fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+                controller.addListener(() => folderController.text = controller.text);
+                return TextField(
+                  controller: controller,
+                  focusNode: focusNode,
+                  textDirection: _textDirection(context),
+                  textAlign: _textAlign(context),
+                  decoration: InputDecoration(labelText: t(context, "folder_label")),
+                );
+              },
             ),
             TextField(
               controller: tagsController,
@@ -1808,61 +2130,101 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
         .where((t) => t.isNotEmpty)
         .toList();
     await api.organizeReport(report.reportId, folderController.text.trim(), tags);
-    await _loadReports();
+    await _load();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (loading) return Scaffold(appBar: AppBar(), body: const Center(child: CircularProgressIndicator()));
+
+    final grouped = _getGroupedReports();
+    final groupKeys = grouped.keys.toList();
+
     return Scaffold(
       appBar: AppBar(
         title: Text(t(context, "recent_reports_title")),
-        actions: appBarActions(context, showLogout: true),
+        actions: [
+          PopupMenuButton<String>(
+            icon: Icon(groupingMode == "none"
+                ? Icons.view_list
+                : groupingMode == "folder"
+                    ? Icons.folder
+                    : Icons.view_agenda),
+            onSelected: (value) => setState(() => groupingMode = value),
+            itemBuilder: (context) => [
+              PopupMenuItem(value: "none", child: Text(t(context, "open_report_button"))),
+              PopupMenuItem(value: "project", child: Text(t(context, "group_by_project"))),
+              PopupMenuItem(value: "folder", child: Text(t(context, "group_by_folder"))),
+            ],
+          ),
+          ...appBarActions(context, showLogout: true),
+        ],
       ),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
-            if (reports.isEmpty)
-              Text(t(context, "no_reports_yet"))
-            else
-              Expanded(
-                child: ListView.builder(
-                  itemCount: reports.length,
-                  itemBuilder: (context, index) {
-                    final r = reports[index];
-                    final subtitleParts = <String>[
-                      r.createdAt,
-                      if (r.location.isNotEmpty) r.location,
-                      if (r.folder.isNotEmpty) "📁 ${r.folder}",
-                      if (r.tags.isNotEmpty) "🏷 ${r.tags.join(", ")}",
-                    ];
-                    return Card(
-                      child: ListTile(
-                        title: Text(appLocale.value.languageCode == "he"
-                            ? r.titleHe
-                            : r.title),
-                        subtitle: Text(subtitleParts.join(" • ")),
-                        trailing: Wrap(
-                          spacing: 8,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.edit),
-                              onPressed: loading ? null : () => _openForEdit(r),
-                              tooltip: t(context, "edit_report_button"),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.folder),
-                              onPressed: loading ? null : () => _organize(r),
-                              tooltip: t(context, "organize_report_button"),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
-                ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: TextField(
+              onChanged: _search,
+              decoration: InputDecoration(
+                hintText: t(context, "search_reports_hint"),
+                prefixIcon: const Icon(Icons.search),
+                border: const OutlineInputBorder(),
               ),
+            ),
+          ),
+          Expanded(
+            child: error != null
+                ? Center(child: Text(error!))
+                : groupingMode != "none"
+                    ? ListView.builder(
+                        itemCount: groupKeys.length,
+                        itemBuilder: (context, i) {
+                          final key = groupKeys[i];
+                          final reports = grouped[key]!;
+                          return ExpansionTile(
+                            initiallyExpanded: true,
+                            title: Text(key, style: const TextStyle(fontWeight: FontWeight.bold)),
+                            subtitle: Text("${reports.length} ${t(context, "recent_reports_title")}"),
+                            children: reports.map((r) => _buildReportTile(r)).toList(),
+                          );
+                        },
+                      )
+                    : ListView.builder(
+                        itemCount: filteredReports.length,
+                        itemBuilder: (context, i) => _buildReportTile(filteredReports[i]),
+                      ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildReportTile(ReportSummary report) {
+    final subtitleParts = <String>[
+      report.createdAt,
+      if (report.location.isNotEmpty) report.location,
+      if (report.folder.isNotEmpty) "📁 ${report.folder}",
+      if (report.tags.isNotEmpty) "🏷 ${report.tags.join(", ")}",
+      if (report.projectName.isNotEmpty) "🏗 ${report.projectName}",
+    ];
+    return Card(
+      child: ListTile(
+        title: Text(appLocale.value.languageCode == "he" ? report.titleHe : report.title),
+        subtitle: Text(subtitleParts.join(" • ")),
+        trailing: Wrap(
+          spacing: 8,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.edit),
+              onPressed: loading ? null : () => _openForEdit(report),
+              tooltip: t(context, "edit_report_button"),
+            ),
+            IconButton(
+              icon: const Icon(Icons.folder),
+              onPressed: loading ? null : () => _organize(report),
+              tooltip: t(context, "organize_report_button"),
+            ),
           ],
         ),
       ),
@@ -1890,16 +2252,18 @@ class _AddItemScreenState extends State<AddItemScreen> {
   String? activeItemId;
   String? error;
   final stt.SpeechToText speech = stt.SpeechToText();
+  final AudioRecorder audioRecorder = AudioRecorder();
+  StreamSubscription<Amplitude>? _ampSub;
   bool isRecording = false;
   String lastTranscript = "";
   double soundLevel = 0.0;
   String? recordingItemId;
   String? recordingField;
+  bool _usingLocalStt = false;
   List<String> descriptionHistory = [];
   List<String> notesHistory = [];
   List<ReportItemData> existingItems = [];
   String? editingItemId;
-  String? speechLocaleId;
   Map<String, List<ReportPhotoData>> itemPhotos = {};
   String? sessionLocation;
   String? sessionTitle;
@@ -1914,6 +2278,8 @@ class _AddItemScreenState extends State<AddItemScreen> {
 
   @override
   void dispose() {
+    _ampSub?.cancel();
+    audioRecorder.dispose();
     descriptionController.dispose();
     descriptionFocus.dispose();
     notesController.dispose();
@@ -1985,53 +2351,29 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
   }
 
-  Future<String?> _resolveSpeechLocale() async {
-    try {
-      final lang = Localizations.localeOf(context).languageCode.toLowerCase();
-      final locales = await speech.locales();
-      api.sendDebugLog("RESOLVE_LOCALE_START", {
-        "current_lang": lang,
-        "device_locales": locales.map((l) => "${l.localeId}:${l.name}").toList()
-      });
-      if (locales.isEmpty) return null;
-
-      // 1. Try exact match for language code (e.g. "he" or "he-IL")
-      for (final l in locales) {
-        final id = l.localeId.toLowerCase();
-        if (id == lang || id == "${lang}_il" || id == "${lang}-il") {
-          api.sendDebugLog("RESOLVE_LOCALE_EXACT_MATCH", {"id": l.localeId});
-          return l.localeId;
-        }
-      }
-
-      // 2. Try prefix match
-      final match = locales.where((l) => l.localeId.toLowerCase().startsWith(lang)).toList();
-      if (match.isNotEmpty) {
-        api.sendDebugLog("RESOLVE_LOCALE_PREFIX_MATCH", {"id": match.first.localeId});
-        return match.first.localeId;
-      }
-
-      // 3. Special case for Hebrew (some devices use legacy "iw")
-      if (lang == "he") {
-        final hebrewMatch = locales.where((l) {
-          final id = l.localeId.toLowerCase();
-          return id.startsWith("he") || id.startsWith("iw");
-        }).toList();
-        if (hebrewMatch.isNotEmpty) {
-          api.sendDebugLog("RESOLVE_LOCALE_HEBREW_MATCH", {"id": hebrewMatch.first.localeId});
-          return hebrewMatch.first.localeId;
-        }
-        api.sendDebugLog("RESOLVE_LOCALE_HEBREW_MISSING", {"available": locales.length});
-        return null;
-      }
-
-      return locales.first.localeId;
-    } catch (e) {
-      api.sendDebugLog("RESOLVE_LOCALE_EXCEPTION", {"error": e.toString()});
-      return null;
-    }
+  String _resolveTranscriptionLanguage() {
+    final lang = Localizations.localeOf(context).languageCode.toLowerCase();
+    if (lang == "iw") return "he";
+    if (lang == "he") return "he";
+    return lang;
   }
 
+  bool _localeMatchesLanguage(String localeId, String lang) {
+    final id = localeId.toLowerCase();
+    if (lang == "he") {
+      return id.startsWith("he") || id.startsWith("iw");
+    }
+    return id.startsWith(lang);
+  }
+
+  Future<bool> _hasLocalSttLanguage(String lang) async {
+    try {
+      final locales = await speech.locales();
+      return locales.any((l) => _localeMatchesLanguage(l.localeId, lang));
+    } catch (e) {
+      return false;
+    }
+  }
 
   Future<bool> _savePhotoToGallery(String path) async {
     if (kIsWeb) return false;
@@ -2048,7 +2390,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
   Future<String?> _backupPhotoToDevice(String path) async {
     if (kIsWeb) return null;
     try {
-      // Android emulator/device path maps to: /data/data/<package>/app_flutter/...
       final dir = await getApplicationDocumentsDirectory();
       final backupDir = Directory("${dir.path}/photo_backups");
       if (!await backupDir.exists()) {
@@ -2077,6 +2418,56 @@ class _AddItemScreenState extends State<AddItemScreen> {
     } catch (_) {}
   }
 
+  Future<String?> _startTranscriptionRecording() async {
+    if (kIsWeb) return null;
+    try {
+      final dir = await getApplicationDocumentsDirectory();
+      final recordingsDir = Directory("${dir.path}/transcriptions");
+      if (!await recordingsDir.exists()) {
+        await recordingsDir.create(recursive: true);
+      }
+      final filename = "speech_${DateTime.now().millisecondsSinceEpoch}.m4a";
+      final path = "${recordingsDir.path}/$filename";
+
+      final hasPerm = await audioRecorder.hasPermission();
+      if (!hasPerm) return null;
+
+      await audioRecorder.start(
+        const RecordConfig(
+          encoder: AudioEncoder.aacLc,
+          sampleRate: 16000,
+          bitRate: 64000,
+          numChannels: 1,
+        ),
+        path: path,
+      );
+
+      await _ampSub?.cancel();
+      _ampSub = audioRecorder
+          .onAmplitudeChanged(const Duration(milliseconds: 200))
+          .listen((amp) {
+        if (mounted) setState(() => soundLevel = amp.current);
+      });
+
+      return path;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<String?> _stopTranscriptionRecording() async {
+    if (kIsWeb) return null;
+    try {
+      final path = await audioRecorder.stop();
+      await _ampSub?.cancel();
+      _ampSub = null;
+      if (mounted) setState(() => soundLevel = 0.0);
+      return path;
+    } catch (_) {
+      return null;
+    }
+  }
+
   Widget _buildAttachments() {
     if (activeItemId == null) return const SizedBox.shrink();
     final photos = itemPhotos[activeItemId] ?? [];
@@ -2100,23 +2491,38 @@ class _AddItemScreenState extends State<AddItemScreen> {
               itemBuilder: (context, index) {
                 final photo = photos[index];
                 final url = "$apiBaseUrl/reports/photo/${photo.id}";
-                return ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: Image.network(
-                    url,
-                    headers: headers,
-                    width: 80,
-                    height: 80,
-                    fit: BoxFit.cover,
-                    errorBuilder: (context, error, stackTrace) {
-                      return Container(
+                return GestureDetector(
+                  onTap: () {
+                    Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => FullScreenImageViewer(
+                          imageUrl: url,
+                          headers: headers,
+                        ),
+                      ),
+                    );
+                  },
+                  child: Hero(
+                    tag: photo.id,
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(6),
+                      child: Image.network(
+                        url,
+                        headers: headers,
                         width: 80,
                         height: 80,
-                        color: Theme.of(context).colorScheme.surfaceVariant,
-                        alignment: Alignment.center,
-                        child: const Icon(Icons.broken_image),
-                      );
-                    },
+                        fit: BoxFit.cover,
+                        errorBuilder: (context, error, stackTrace) {
+                          return Container(
+                            width: 80,
+                            height: 80,
+                            color: Theme.of(context).colorScheme.surfaceVariant,
+                            alignment: Alignment.center,
+                            child: const Icon(Icons.broken_image),
+                          );
+                        },
+                      ),
+                    ),
                   ),
                 );
               },
@@ -2153,81 +2559,6 @@ class _AddItemScreenState extends State<AddItemScreen> {
     await _loadExistingItems();
   }
 
-  Future<bool> _createItemFromDraftForMedia() async {
-    final descriptionTrimmed = descriptionController.text.trim();
-    final notesTrimmed = notesController.text.trim();
-    if (descriptionTrimmed.isEmpty && notesTrimmed.isEmpty) {
-      return false;
-    }
-    if (descriptionTrimmed.isEmpty && notesTrimmed.isNotEmpty) {
-      final proceed = await showDialog<bool>(
-        context: context,
-        builder: (context) => AlertDialog(
-          title: Text(t(context, "confirm_notes_only_title")),
-          content: Text(t(context, "confirm_notes_only_body")),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(false),
-              child: Text(t(context, "confirm_notes_only_no")),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pop(true),
-              child: Text(t(context, "confirm_notes_only_yes")),
-            ),
-          ],
-        ),
-      );
-      if (proceed != true) {
-        return false;
-      }
-    }
-    final id = await api.addItem(descriptionTrimmed, notesTrimmed);
-    setState(() {
-      currentItemId = id;
-      activeItemId = id;
-      editingItemId = id;
-    });
-    await _loadExistingItems();
-    return true;
-  }
-
-  Future<String?> _promptForItemSelection() async {
-    if (existingItems.isEmpty) return null;
-    if (!mounted) return null;
-    return showModalBottomSheet<String>(
-      context: context,
-      builder: (context) {
-        return SafeArea(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(12),
-                child: Text(t(context, "select_item_title")),
-              ),
-              Flexible(
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: existingItems.length,
-                  itemBuilder: (context, index) {
-                    final item = existingItems[index];
-                    final label = item.description.isNotEmpty
-                        ? item.description
-                        : (item.notes.isNotEmpty ? item.notes : item.number);
-                    return ListTile(
-                      title: Text("${item.number}  $label"),
-                      onTap: () => Navigator.of(context).pop(item.id),
-                    );
-                  },
-                ),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
   Future<bool> _ensureActiveItemForMedia() async {
     if (activeItemId != null) return true;
     if (existingItems.isNotEmpty) {
@@ -2248,6 +2579,13 @@ class _AddItemScreenState extends State<AddItemScreen> {
       if (descriptionTrimmed.isEmpty && notesTrimmed.isEmpty) {
         if (_itemHasPhoto(activeItemId)) {
           await _createEmptyItem();
+          if (mounted) {
+            setState(() {
+              activeItemId = null;
+              currentItemId = null;
+              editingItemId = null;
+            });
+          }
           return;
         }
         setState(() => error = t(context, "error_item_empty"));
@@ -2281,6 +2619,8 @@ class _AddItemScreenState extends State<AddItemScreen> {
         );
         setState(() {
           editingItemId = null;
+          activeItemId = null;
+          currentItemId = null;
           descriptionController.clear();
           notesController.clear();
           lastTranscript = "";
@@ -2305,6 +2645,15 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
   }
 
+  Future<File?> _processImageWithMarkup(XFile picked) async {
+    final edited = await Navigator.of(context).push<File>(
+      MaterialPageRoute(
+        builder: (_) => ImageMarkupScreen(imageFile: File(picked.path)),
+      ),
+    );
+    return edited;
+  }
+
   Future<void> _takePhoto() async {
     if (!await _ensureActiveItemForMedia()) {
       return;
@@ -2315,39 +2664,21 @@ class _AddItemScreenState extends State<AddItemScreen> {
       return;
     }
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.camera);
+    final picked = await picker.pickImage(
+      source: ImageSource.camera,
+      imageQuality: 85,
+      maxWidth: 1920,
+    );
     if (picked != null) {
-      setState(() => photo = File(picked.path));
-      final saved = await _savePhotoToGallery(picked.path);
+      final finalFile = await _processImageWithMarkup(picked) ?? File(picked.path);
+      setState(() => photo = finalFile);
+      final saved = await _savePhotoToGallery(finalFile.path);
       String? backupPath;
       if (!saved) {
-        backupPath = await _backupPhotoToDevice(picked.path);
+        backupPath = await _backupPhotoToDevice(finalFile.path);
       }
       _cleanupTempMedia(picked.path);
-      await _uploadPhotoFile(File(picked.path), activeItemId!, backupPath: backupPath);
-    }
-  }
-
-  Future<void> _takePhotoForItem(String itemId) async {
-    final camOk = await Permission.camera.request();
-    if (!camOk.isGranted) {
-      setState(() => error = t(context, "permission_camera_denied"));
-      return;
-    }
-    final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.camera);
-    if (picked == null) return;
-    try {
-      final saved = await _savePhotoToGallery(picked.path);
-      String? backupPath;
-      if (!saved) {
-        backupPath = await _backupPhotoToDevice(picked.path);
-      }
-      _cleanupTempMedia(picked.path);
-      await _uploadPhotoFile(File(picked.path), itemId, backupPath: backupPath);
-      await _loadExistingItems();
-    } catch (e) {
-      setState(() => error = e.toString());
+      await _uploadPhotoFile(finalFile, activeItemId!, backupPath: backupPath);
     }
   }
 
@@ -2355,21 +2686,41 @@ class _AddItemScreenState extends State<AddItemScreen> {
     if (!await _ensureActiveItemForMedia()) {
       return;
     }
-    final photosOk = await Permission.photos.request();
-    if (!photosOk.isGranted) {
+    if (error != null) {
+      setState(() => error = null);
+    }
+    final photosOk = await _requestGalleryPermission();
+    if (!photosOk) {
       setState(() => error = t(context, "permission_photos_denied"));
       return;
     }
     final picker = ImagePicker();
-    final picked = await picker.pickImage(source: ImageSource.gallery);
+    final picked = await picker.pickImage(
+      source: ImageSource.gallery,
+      imageQuality: 85,
+      maxWidth: 1920,
+    );
     if (picked == null) return;
-    final saved = await _savePhotoToGallery(picked.path);
+    final finalFile = await _processImageWithMarkup(picked) ?? File(picked.path);
+    final saved = await _savePhotoToGallery(finalFile.path);
     String? backupPath;
     if (!saved) {
-      backupPath = await _backupPhotoToDevice(picked.path);
+      backupPath = await _backupPhotoToDevice(finalFile.path);
     }
     _cleanupTempMedia(picked.path);
-    await _uploadPhotoFile(File(picked.path), activeItemId!, backupPath: backupPath);
+    await _uploadPhotoFile(finalFile, activeItemId!, backupPath: backupPath);
+  }
+
+  Future<bool> _requestGalleryPermission() async {
+    if (kIsWeb) return true;
+    if (Platform.isAndroid) {
+      final photos = await Permission.photos.request();
+      if (photos.isGranted) return true;
+      final storage = await Permission.storage.request();
+      return storage.isGranted;
+    }
+    final photos = await Permission.photos.request();
+    return photos.isGranted;
   }
 
   Future<void> _uploadPhotoFile(File file, String itemId, {String? backupPath}) async {
@@ -2389,7 +2740,33 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
   }
 
-  Future<void> _finalize() async {
+  void _hideLoading() {
+    if (mounted) {
+      Navigator.of(context, rootNavigator: true).pop();
+    }
+  }
+
+  void _showLoading(String message) {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => WillPopScope(
+        onWillPop: () async => false,
+        child: AlertDialog(
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(),
+              const SizedBox(height: 16),
+              Text(message),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _finalize({bool pdf = false}) async {
     try {
       final committed = await _commitDraftItemBeforeFinalize();
       if (!committed) return;
@@ -2427,13 +2804,20 @@ class _AddItemScreenState extends State<AddItemScreen> {
         "$datePart-$timePart",
       ];
       final filename = filenameParts.join("_");
-      final path = await api.finalizeAndSave(filename: filename);
+      _showLoading(t(context, pdf ? "generating_pdf_loading" : "generating_report_loading"));
+      File? logo;
+      if (selectedLogoPath.value != null) {
+        logo = File(selectedLogoPath.value!);
+      }
+      final path = await api.finalizeAndSave(filename: filename, logoFile: logo, pdf: pdf);
+      _hideLoading();
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => DoneScreen(filePath: path)),
         );
       }
     } catch (e) {
+      if (mounted) _hideLoading();
       setState(() => error = e.toString());
     }
   }
@@ -2522,92 +2906,90 @@ class _AddItemScreenState extends State<AddItemScreen> {
   Future<void> _toggleRecording({String? targetItemId, String? targetField}) async {
     try {
       if (!isRecording) {
-        if (error != null) {
-          setState(() => error = null);
-        }
-        api.sendDebugLog("STT_START_ATTEMPT", {"field": targetField});
+        if (error != null) setState(() => error = null);
         final micOk = await Permission.microphone.request();
-        api.sendDebugLog("MIC_PERMISSION", {"granted": micOk.isGranted});
         if (!micOk.isGranted) {
           setState(() => error = t(context, "transcription_error"));
           return;
         }
 
-        final available = await speech.initialize(
-          onStatus: (status) {
-            debugPrint("STT Status: $status");
-            api.sendDebugLog("STT_STATUS", {"status": status});
-          },
-          onError: (err) {
-            debugPrint("STT Error: ${err.errorMsg}");
-            api.sendDebugLog("STT_ERROR", {"msg": err.errorMsg, "permanent": err.permanent});
-            if (mounted) {
-              setState(() => error = t(context, "transcription_error"));
-            }
-          },
-          debugLogging: true,
-        );
-
-        api.sendDebugLog("STT_INITIALIZED", {"available": available});
-        if (!available) {
-          setState(() => error = t(context, "speech_not_available"));
-          return;
+        final lang = _resolveTranscriptionLanguage();
+        bool localAvailable = false;
+        try {
+          localAvailable = await speech.initialize(
+            onStatus: (status) {
+              debugPrint("STT Status: $status");
+            },
+            onError: (err) {
+              debugPrint("STT Error: ${err.errorMsg}");
+              if (mounted) {
+                setState(() => error = t(context, "transcription_error"));
+              }
+            },
+            debugLogging: true,
+          );
+        } catch (_) {
+          localAvailable = false;
         }
 
-        speechLocaleId = await _resolveSpeechLocale();
-        api.sendDebugLog("STT_LOCALE", {"locale": speechLocaleId});
-        if (speechLocaleId == null) {
-          setState(() => error = t(context, "speech_not_available"));
-          return;
-        }
-
-        setState(() {
-          isRecording = true;
-          lastTranscript = "";
-          recordingItemId = targetItemId;
-          recordingField = targetField;
-        });
-
-        await speech.listen(
-          localeId: speechLocaleId!,
-          onResult: (result) {
-            api.sendDebugLog("STT_RESULT", {
-              "words": result.recognizedWords,
-              "final": result.finalResult,
-              "confidence": result.confidence
-            });
-            if (mounted) {
-              setState(() {
-                lastTranscript = result.recognizedWords;
-                if (recordingItemId == null) {
-                  if (recordingField == "description") {
-                    descriptionController.text = lastTranscript;
-                    descriptionController.selection = TextSelection.fromPosition(
-                      TextPosition(offset: descriptionController.text.length),
-                    );
-                  } else {
-                    notesController.text = lastTranscript;
-                    notesController.selection = TextSelection.fromPosition(
-                      TextPosition(offset: notesController.text.length),
-                    );
+        if (localAvailable && await _hasLocalSttLanguage(lang)) {
+          setState(() {
+            isRecording = true;
+            recordingItemId = targetItemId;
+            recordingField = targetField;
+            _usingLocalStt = true;
+            lastTranscript = "";
+          });
+          await speech.listen(
+            localeId: lang,
+            onResult: (result) {
+              if (mounted) {
+                setState(() {
+                  lastTranscript = result.recognizedWords;
+                  if (recordingItemId == null) {
+                    if (recordingField == "description") {
+                      descriptionController.text = lastTranscript;
+                      descriptionController.selection = TextSelection.fromPosition(
+                        TextPosition(offset: descriptionController.text.length),
+                      );
+                    } else {
+                      notesController.text = lastTranscript;
+                      notesController.selection = TextSelection.fromPosition(
+                        TextPosition(offset: notesController.text.length),
+                      );
+                    }
                   }
-                }
-              });
-            }
-          },
-          onSoundLevelChange: (level) {
-            if (mounted) setState(() => soundLevel = level);
-          },
-          cancelOnError: false,
-          partialResults: true,
-          listenMode: stt.ListenMode.dictation,
-          listenFor: const Duration(seconds: 30),
-          pauseFor: const Duration(seconds: 10),
-        );
+                });
+              }
+            },
+            onSoundLevelChange: (level) {
+              if (mounted) setState(() => soundLevel = level);
+            },
+            cancelOnError: false,
+            partialResults: true,
+            listenMode: stt.ListenMode.dictation,
+            listenFor: const Duration(seconds: 30),
+            pauseFor: const Duration(seconds: 10),
+          );
+        } else {
+          final path = await _startTranscriptionRecording();
+          if (path == null) {
+            setState(() {
+              isRecording = false;
+              error = t(context, "transcription_error");
+            });
+            return;
+          }
+          setState(() {
+            isRecording = true;
+            recordingItemId = targetItemId;
+            recordingField = targetField;
+            _usingLocalStt = false;
+          });
+        }
       } else {
-        api.sendDebugLog("STT_STOP_REQUEST", {});
-        await speech.stop();
         final target = recordingItemId;
+        final field = recordingField;
         if (mounted) {
           setState(() {
             isRecording = false;
@@ -2615,16 +2997,52 @@ class _AddItemScreenState extends State<AddItemScreen> {
             recordingField = null;
           });
         }
-        if (target != null && lastTranscript.isNotEmpty) {
-          await _applyTranscriptToItem(target, lastTranscript);
-        }
-        if (mounted) {
-          setState(() => soundLevel = 0.0);
+        if (_usingLocalStt) {
+          await speech.stop();
+          _usingLocalStt = false;
+          if (target != null && lastTranscript.isNotEmpty) {
+            await _applyTranscriptToItem(target, lastTranscript);
+          }
+          if (mounted) setState(() => soundLevel = 0.0);
+        } else {
+          final path = await _stopTranscriptionRecording();
+          if (path == null) {
+            setState(() => error = t(context, "transcription_error"));
+            return;
+          }
+          final language = _resolveTranscriptionLanguage();
+          _showLoading(t(context, "transcribing_loading"));
+          final transcript = await api.transcribeAudio(File(path), language: language);
+          _hideLoading();
+          try {
+            await File(path).delete();
+          } catch (_) {}
+          if (transcript.trim().isEmpty) {
+            setState(() => error = t(context, "transcription_error"));
+            return;
+          }
+          setState(() => lastTranscript = transcript);
+          if (target != null) {
+            await _applyTranscriptToItem(target, transcript);
+          } else if (field == "description") {
+            final current = descriptionController.text.trim();
+            final combined = current.isEmpty ? transcript : "$current\n$transcript";
+            descriptionController.text = combined;
+            descriptionController.selection = TextSelection.fromPosition(
+              TextPosition(offset: descriptionController.text.length),
+            );
+          } else {
+            final current = notesController.text.trim();
+            final combined = current.isEmpty ? transcript : "$current\n$transcript";
+            notesController.text = combined;
+            notesController.selection = TextSelection.fromPosition(
+              TextPosition(offset: notesController.text.length),
+            );
+          }
         }
       }
     } catch (e) {
       debugPrint("Toggle recording error: $e");
-      api.sendDebugLog("TOGGLE_RECORDING_EXCEPTION", {"error": e.toString()});
       if (mounted) {
         setState(() {
           isRecording = false;
@@ -2634,204 +3052,281 @@ class _AddItemScreenState extends State<AddItemScreen> {
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(t(context, "add_item_title")),
-        actions: appBarActions(
-          context,
-          showLogout: true,
-          showCancelReport: true,
-          onSelected: (value) {
-            if (value == "cancel_report") {
-              _cancelReport();
-            }
-          },
-        ),
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(16),
-        children: [
-            if (existingItems.where(_itemHasContent).isNotEmpty)
-              SizedBox(
-                height: 120,
+  Future<String?> _promptForItemSelection() async {
+    if (existingItems.isEmpty) return null;
+    if (!mounted) return null;
+    return showModalBottomSheet<String>(
+      context: context,
+      builder: (context) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Text(t(context, "select_item_title")),
+              ),
+              Flexible(
                 child: ListView.builder(
-                  itemCount: existingItems.where(_itemHasContent).length,
+                  shrinkWrap: true,
+                  itemCount: existingItems.length,
                   itemBuilder: (context, index) {
-                    final item = existingItems.where(_itemHasContent).toList()[index];
+                    final item = existingItems[index];
+                    final label = item.description.isNotEmpty
+                        ? item.description
+                        : (item.notes.isNotEmpty ? item.notes : item.number);
                     return ListTile(
-                      title: Text("${item.number}. ${item.description}"),
-                      subtitle: Text(item.notes),
-                      selected: item.id == activeItemId,
-                      selectedTileColor: Theme.of(context).colorScheme.primary.withOpacity(0.08),
-                      onTap: () {
-                        setState(() {
-                          activeItemId = item.id;
-                          currentItemId = item.id;
-                          editingItemId = item.id;
-                          descriptionController.text = item.description;
-                          notesController.text = item.notes;
-                        });
-                      },
+                      title: Text("${item.number}  $label"),
+                      onTap: () => Navigator.of(context).pop(item.id),
                     );
                   },
                 ),
               ),
-            Autocomplete<String>(
-              optionsBuilder: (value) {
-                if (value.text.isEmpty) {
-                  return descriptionHistory;
-                }
-                return descriptionHistory.where(
-                  (option) => option.toLowerCase().contains(value.text.toLowerCase()),
-                );
-              },
-              fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
-                controller.text = descriptionController.text;
-                controller.selection = TextSelection.fromPosition(
-                  TextPosition(offset: controller.text.length),
-                );
-                controller.addListener(() {
-                  descriptionController.text = controller.text;
-                });
-                return TextField(
-                  controller: controller,
-                  focusNode: descriptionFocus,
-                  textDirection: _textDirection(context),
-                  textAlign: _textAlign(context),
-                  keyboardType: TextInputType.multiline,
-                  minLines: 3,
-                  maxLines: null,
-                  decoration: InputDecoration(labelText: t(context, "description_label")),
-                  onChanged: (_) {
-                    if (error != null) setState(() => error = null);
-                  },
-                );
-              },
-            ),
-            Row(
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.photo_camera, size: 18),
-                  tooltip: t(context, "take_photo_button"),
-                  onPressed: () {
-                    descriptionFocus.requestFocus();
-                    _takePhoto();
-                  },
-                ),
-                IconButton(
-                  icon: const Icon(Icons.photo_library, size: 18),
-                  tooltip: t(context, "upload_photo_button"),
-                  onPressed: () {
-                    descriptionFocus.requestFocus();
-                    _uploadPhoto();
-                  },
-                ),
-                IconButton(
-                  icon: Icon(isRecording && recordingField == "description" ? Icons.stop : Icons.mic, size: 18),
-                  tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
-                  onPressed: isRecording && recordingField != "description"
-                      ? null
-                      : () => _toggleRecording(targetField: "description"),
-                ),
-                if (isRecording && recordingField == "description")
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      child: LinearProgressIndicator(
-                        value: (soundLevel + 2) / 15, // Normalize rmsDB to 0.0-1.0
-                        backgroundColor: Colors.grey[200],
-                        valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
-                      ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final visibleItems = existingItems.where(_itemHasContent).toList();
+    final allPhotos = itemPhotos.values.expand((e) => e).toList();
+    final headers = api.token != null ? {"Authorization": "Bearer ${api.token}"} : <String, String>{};
+
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(t(context, "add_item_title")),
+        actions: [
+          if (allPhotos.isNotEmpty)
+            IconButton(
+              icon: const Icon(Icons.photo_library),
+              tooltip: t(context, "gallery_title"),
+              onPressed: () {
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => ReportGalleryScreen(
+                      photos: allPhotos,
+                      headers: headers,
                     ),
                   ),
-              ],
-            ),
-            Autocomplete<String>(
-              optionsBuilder: (value) {
-                if (value.text.isEmpty) {
-                  return notesHistory;
-                }
-                return notesHistory.where(
-                  (option) => option.toLowerCase().contains(value.text.toLowerCase()),
-                );
-              },
-              fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
-                controller.text = notesController.text;
-                controller.selection = TextSelection.fromPosition(
-                  TextPosition(offset: controller.text.length),
-                );
-                controller.addListener(() {
-                  notesController.text = controller.text;
-                });
-                return TextField(
-                  controller: controller,
-                  focusNode: notesFocus,
-                  textDirection: _textDirection(context),
-                  textAlign: _textAlign(context),
-                  keyboardType: TextInputType.multiline,
-                  minLines: 3,
-                  maxLines: null,
-                  decoration: InputDecoration(labelText: t(context, "notes_label")),
-                  onChanged: (_) {
-                    if (error != null) setState(() => error = null);
-                  },
                 );
               },
             ),
-            Row(
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.photo_camera, size: 18),
-                  tooltip: t(context, "take_photo_button"),
-                  onPressed: () {
-                    notesFocus.requestFocus();
-                    _takePhoto();
-                  },
-                ),
-                IconButton(
-                  icon: const Icon(Icons.photo_library, size: 18),
-                  tooltip: t(context, "upload_photo_button"),
-                  onPressed: () {
-                    notesFocus.requestFocus();
-                    _uploadPhoto();
-                  },
-                ),
-                IconButton(
-                  icon: Icon(isRecording && recordingField == "notes" ? Icons.stop : Icons.mic, size: 18),
-                  tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
-                  onPressed: isRecording && recordingField != "notes"
-                      ? null
-                      : () => _toggleRecording(targetField: "notes"),
-                ),
-                if (isRecording && recordingField == "notes")
-                  Expanded(
-                    child: Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      child: LinearProgressIndicator(
-                        value: (soundLevel + 2) / 15, // Normalize rmsDB to 0.0-1.0
-                        backgroundColor: Colors.grey[200],
-                        valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
-                      ),
-                    ),
-                  ),
-              ],
-            ),
-            _buildAttachments(),
-            const SizedBox(height: 12),
-            if (lastTranscript.isNotEmpty)
-              Padding(
-                padding: const EdgeInsets.only(top: 8),
-                child: Text("${t(context, "transcription_label")}: $lastTranscript"),
+          ...appBarActions(
+            context,
+            showLogout: true,
+            showCancelReport: true,
+            onSelected: (value) {
+              if (value == "cancel_report") {
+                _cancelReport();
+              }
+            },
+          ),
+        ],
+      ),
+      body: ListView(
+        padding: const EdgeInsets.all(16),
+        children: [
+          if (visibleItems.isNotEmpty)
+            Container(
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.grey[300]!),
+                borderRadius: BorderRadius.circular(8),
               ),
-            const SizedBox(height: 12),
-            ElevatedButton(onPressed: _addItem, child: Text(t(context, "add_item_button"))),
-            const SizedBox(height: 12),
-            if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
-            const SizedBox(height: 8),
-            ElevatedButton(onPressed: _finalize, child: Text(t(context, "generate_report_button"))),
-          ],
+              constraints: const BoxConstraints(maxHeight: 200),
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: visibleItems.length,
+                padding: EdgeInsets.zero,
+                itemBuilder: (context, index) {
+                  final item = visibleItems[index];
+                  return ListTile(
+                    dense: true,
+                    title: Text("${item.number}. ${item.description}"),
+                    subtitle: Text(item.notes, maxLines: 1, overflow: TextOverflow.ellipsis),
+                    selected: item.id == activeItemId,
+                    selectedTileColor: Theme.of(context).colorScheme.primary.withOpacity(0.08),
+                    onTap: () {
+                      setState(() {
+                        activeItemId = item.id;
+                        currentItemId = item.id;
+                        editingItemId = item.id;
+                        descriptionController.text = item.description;
+                        notesController.text = item.notes;
+                      });
+                    },
+                  );
+                },
+              ),
+            ),
+          Autocomplete<String>(
+            optionsBuilder: (value) {
+              if (value.text.isEmpty) {
+                return descriptionHistory;
+              }
+              return descriptionHistory.where(
+                (option) => option.toLowerCase().contains(value.text.toLowerCase()),
+              );
+            },
+            fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+              controller.text = descriptionController.text;
+              controller.selection = TextSelection.fromPosition(
+                TextPosition(offset: controller.text.length),
+              );
+              controller.addListener(() {
+                descriptionController.text = controller.text;
+              });
+              return TextField(
+                controller: controller,
+                focusNode: descriptionFocus,
+                textDirection: _textDirection(context),
+                textAlign: _textAlign(context),
+                keyboardType: TextInputType.multiline,
+                minLines: 3,
+                maxLines: null,
+                decoration: InputDecoration(labelText: t(context, "description_label")),
+                onChanged: (_) {
+                  if (error != null) setState(() => error = null);
+                },
+              );
+            },
+          ),
+          Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.photo_camera, size: 18),
+                tooltip: t(context, "take_photo_button"),
+                onPressed: () {
+                  descriptionFocus.requestFocus();
+                  _takePhoto();
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.photo_library, size: 18),
+                tooltip: t(context, "upload_photo_button"),
+                onPressed: () {
+                  descriptionFocus.requestFocus();
+                  _uploadPhoto();
+                },
+              ),
+              IconButton(
+                icon: Icon(isRecording && recordingField == "description" ? Icons.stop : Icons.mic, size: 18),
+                tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
+                onPressed: isRecording && recordingField != "description"
+                    ? null
+                    : () => _toggleRecording(targetField: "description"),
+              ),
+              if (isRecording && recordingField == "description")
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: LinearProgressIndicator(
+                      value: (soundLevel + 2) / 15,
+                      backgroundColor: Colors.grey[200],
+                      valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          Autocomplete<String>(
+            optionsBuilder: (value) {
+              if (value.text.isEmpty) {
+                return notesHistory;
+              }
+              return notesHistory.where(
+                (option) => option.toLowerCase().contains(value.text.toLowerCase()),
+              );
+            },
+            fieldViewBuilder: (context, controller, focusNode, onFieldSubmitted) {
+              controller.text = notesController.text;
+              controller.selection = TextSelection.fromPosition(
+                TextPosition(offset: controller.text.length),
+              );
+              controller.addListener(() {
+                notesController.text = controller.text;
+              });
+              return TextField(
+                controller: controller,
+                focusNode: notesFocus,
+                textDirection: _textDirection(context),
+                textAlign: _textAlign(context),
+                keyboardType: TextInputType.multiline,
+                minLines: 3,
+                maxLines: null,
+                decoration: InputDecoration(labelText: t(context, "notes_label")),
+                onChanged: (_) {
+                  if (error != null) setState(() => error = null);
+                },
+              );
+            },
+          ),
+          Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.photo_camera, size: 18),
+                tooltip: t(context, "take_photo_button"),
+                onPressed: () {
+                  notesFocus.requestFocus();
+                  _takePhoto();
+                },
+              ),
+              IconButton(
+                icon: const Icon(Icons.photo_library, size: 18),
+                tooltip: t(context, "upload_photo_button"),
+                onPressed: () {
+                  notesFocus.requestFocus();
+                  _uploadPhoto();
+                },
+              ),
+              IconButton(
+                icon: Icon(isRecording && recordingField == "notes" ? Icons.stop : Icons.mic, size: 18),
+                tooltip: isRecording ? t(context, "stop_recording_button") : t(context, "start_recording_button"),
+                onPressed: isRecording && recordingField != "notes"
+                    ? null
+                    : () => _toggleRecording(targetField: "notes"),
+              ),
+              if (isRecording && recordingField == "notes")
+                Expanded(
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: LinearProgressIndicator(
+                      value: (soundLevel + 2) / 15,
+                      backgroundColor: Colors.grey[200],
+                      valueColor: AlwaysStoppedAnimation<Color>(Theme.of(context).primaryColor),
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          _buildAttachments(),
+          const SizedBox(height: 12),
+          if (isRecording)
+            Padding(
+              padding: const EdgeInsets.only(top: 6),
+              child: Text(
+                t(context, _usingLocalStt ? "transcription_mode_local" : "transcription_mode_server"),
+                style: TextStyle(color: Theme.of(context).colorScheme.secondary),
+              ),
+            ),
+          const SizedBox(height: 12),
+          ElevatedButton(onPressed: _addItem, child: Text(t(context, "add_item_button"))),
+          const SizedBox(height: 12),
+          if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
+          const SizedBox(height: 8),
+          ElevatedButton(
+            onPressed: () => _finalize(pdf: true),
+            child: Text(t(context, "generate_pdf_button")),
+          ),
+          const SizedBox(height: 8),
+          OutlinedButton(
+            onPressed: () => _finalize(pdf: false),
+            child: Text(t(context, "generate_docx_button")),
+          ),
+        ],
       ),
     );
   }
@@ -2885,7 +3380,6 @@ class DoneScreen extends StatelessWidget {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(t(context, "done_title")),
         actions: appBarActions(context, showLogout: true),
       ),
       body: Center(
@@ -2922,6 +3416,399 @@ class DoneScreen extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class FullScreenImageViewer extends StatelessWidget {
+  const FullScreenImageViewer({
+    super.key,
+    required this.imageUrl,
+    this.headers,
+  });
+
+  final String imageUrl;
+  final Map<String, String>? headers;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: Colors.black,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Center(
+        child: InteractiveViewer(
+          minScale: 0.5,
+          maxScale: 4.0,
+          child: Image.network(
+            imageUrl,
+            headers: headers,
+            fit: BoxFit.contain,
+            loadingBuilder: (context, child, loadingProgress) {
+              if (loadingProgress == null) return child;
+              return const Center(child: CircularProgressIndicator());
+            },
+            errorBuilder: (context, error, stackTrace) {
+              return const Center(
+                child: Icon(Icons.broken_image, color: Colors.white, size: 48),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class ImageMarkupScreen extends StatefulWidget {
+  const ImageMarkupScreen({super.key, required this.imageFile});
+  final File imageFile;
+
+  @override
+  State<ImageMarkupScreen> createState() => _ImageMarkupScreenState();
+}
+
+class _ImageMarkupScreenState extends State<ImageMarkupScreen> {
+  late ImagePainterController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = ImagePainterController(
+      color: Colors.red,
+      mode: PaintMode.freeStyle,
+      strokeWidth: 4.0,
+    );
+  }
+
+  Future<void> _save() async {
+    final bytes = await _controller.exportImage();
+    if (bytes != null) {
+      final dir = await getTemporaryDirectory();
+      final path = "${dir.path}/markup_${DateTime.now().millisecondsSinceEpoch}.png";
+      final file = File(path);
+      await file.writeAsBytes(bytes);
+      if (mounted) Navigator.of(context).pop(file);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(t(context, "save_markup")),
+        actions: [
+          IconButton(onPressed: _save, icon: const Icon(Icons.check)),
+        ],
+      ),
+      body: ImagePainter.file(
+        widget.imageFile,
+        controller: _controller,
+        scalable: true,
+      ),
+    );
+  }
+}
+
+class ReportGalleryScreen extends StatelessWidget {
+  const ReportGalleryScreen({
+    super.key,
+    required this.photos,
+    required this.headers,
+  });
+
+  final List<ReportPhotoData> photos;
+  final Map<String, String> headers;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(t(context, "gallery_title"))),
+      body: GridView.builder(
+        padding: const EdgeInsets.all(8),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3,
+          crossAxisSpacing: 8,
+          mainAxisSpacing: 8,
+        ),
+        itemCount: photos.length,
+        itemBuilder: (context, index) {
+          final photo = photos[index];
+          final url = "$apiBaseUrl/reports/photo/${photo.id}";
+          return GestureDetector(
+            onTap: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => FullScreenImageViewer(
+                    imageUrl: url,
+                    headers: headers,
+                  ),
+                ),
+              );
+            },
+            child: Hero(
+              tag: photo.id,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Image.network(
+                  url,
+                  headers: headers,
+                  fit: BoxFit.cover,
+                  errorBuilder: (_, __, ___) => const Icon(Icons.broken_image),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key});
+
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  final nameController = TextEditingController();
+  final roleController = TextEditingController();
+  final phoneController = TextEditingController();
+  final companyController = TextEditingController();
+  bool loading = true;
+  String? error;
+  String? signaturePath;
+  String? profileLogoPath;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadProfile();
+  }
+
+  Future<void> _loadProfile() async {
+    try {
+      final data = await api.getMe();
+      if (mounted) {
+        setState(() {
+          nameController.text = data["full_name"] ?? "";
+          roleController.text = data["role_title"] ?? "";
+          phoneController.text = data["phone_contact"] ?? "";
+          companyController.text = data["company_name"] ?? "";
+          signaturePath = data["signature_path"];
+          profileLogoPath = data["logo_path"];
+          loading = false;
+        });
+      }
+    } catch (e) {
+      if (mounted) setState(() => error = e.toString());
+    }
+  }
+
+  Future<void> _pickProfileLogo() async {
+    final picker = ImagePicker();
+    final picked = await picker.pickImage(source: ImageSource.gallery);
+    if (picked != null) {
+      setState(() => loading = true);
+      try {
+        await api.uploadProfileLogo(File(picked.path));
+        await _loadProfile();
+      } catch (e) {
+        if (mounted) setState(() => error = e.toString());
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    }
+  }
+
+  Future<void> _pickSignature() async {
+    final controller = ImagePainterController(
+      color: Colors.black,
+      strokeWidth: 4,
+      mode: PaintMode.freeStyle,
+    );
+
+    final signature = await showDialog<Uint8List?>(
+      context: context,
+      builder: (context) => Scaffold(
+        appBar: AppBar(
+          title: Text(t(context, "sign_button")),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.check),
+              onPressed: () async {
+                final image = await controller.exportImage();
+                if (mounted) Navigator.of(context).pop(image);
+              },
+            ),
+          ],
+        ),
+        body: Container(
+          color: Colors.white,
+          child: ImagePainter.signature(
+            controller: controller,
+            height: double.infinity,
+            width: double.infinity,
+          ),
+        ),
+      ),
+    );
+
+    if (signature != null) {
+      setState(() => loading = true);
+      try {
+        final dir = await getTemporaryDirectory();
+        final file = File("${dir.path}/sig_${DateTime.now().millisecondsSinceEpoch}.png");
+        await file.writeAsBytes(signature);
+        await api.uploadSignature(file);
+        await _loadProfile();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(t(context, "signature_saved_success"))),
+          );
+        }
+      } catch (e) {
+        if (mounted) setState(() => error = e.toString());
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    }
+  }
+
+  Future<void> _save() async {
+    setState(() => loading = true);
+    try {
+      await api.updateProfile(
+        fullName: nameController.text.trim(),
+        roleTitle: roleController.text.trim(),
+        phoneContact: phoneController.text.trim(),
+        companyName: companyController.text.trim(),
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(t(context, "profile_saved_success"))),
+        );
+        Navigator.of(context).pop();
+      }
+    } catch (e) {
+      if (mounted) setState(() {
+        error = e.toString();
+        loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text(t(context, "profile_title"))),
+      body: loading 
+        ? const Center(child: CircularProgressIndicator())
+        : ListView(
+            padding: const EdgeInsets.all(16),
+            children: [
+              if (error != null) Text(error!, style: const TextStyle(color: Colors.red)),
+              TextField(
+                controller: nameController,
+                decoration: InputDecoration(labelText: t(context, "full_name_label")),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: roleController,
+                decoration: InputDecoration(labelText: t(context, "role_title_label")),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: phoneController,
+                decoration: InputDecoration(labelText: t(context, "phone_contact_label")),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: companyController,
+                decoration: InputDecoration(labelText: t(context, "company_name_label")),
+              ),
+              const SizedBox(height: 24),
+              Text(t(context, "logo_selector_title"), style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              if (profileLogoPath != null)
+                Container(
+                  height: 100,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Image.network(
+                    api.getProfileLogoUrl(),
+                    headers: api._headers(),
+                    key: ValueKey(profileLogoPath),
+                    fit: BoxFit.contain,
+                    errorBuilder: (_, __, ___) => const Icon(Icons.business, size: 40, color: Colors.grey),
+                  ),
+                )
+              else
+                Container(
+                  height: 100,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey, style: BorderStyle.solid),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Center(child: Icon(Icons.business, size: 40, color: Colors.grey)),
+                ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _pickProfileLogo,
+                icon: const Icon(Icons.add_photo_alternate),
+                label: Text(t(context, "pick_logo_button")),
+              ),
+              const SizedBox(height: 24),
+              Text(t(context, "signature_label"), style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              if (signaturePath != null)
+                Container(
+                  height: 100,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Image.network(
+                    api.getSignatureUrl(),
+                    headers: api._headers(),
+                    // Cache buster to ensure update shows immediately
+                    key: ValueKey(signaturePath),
+                    fit: BoxFit.contain,
+                    errorBuilder: (_, __, ___) => const Icon(Icons.gesture, size: 40, color: Colors.grey),
+                  ),
+                )
+              else
+                Container(
+                  height: 100,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    border: Border.all(color: Colors.grey, style: BorderStyle.solid),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Center(child: Icon(Icons.gesture, size: 40, color: Colors.grey)),
+                ),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                onPressed: _pickSignature,
+                icon: const Icon(Icons.edit),
+                label: Text(t(context, "sign_button")),
+              ),
+              const SizedBox(height: 24),
+              ElevatedButton(
+                onPressed: _save,
+                child: Text(t(context, "save_profile_button")),
+              ),
+            ],
+          ),
     );
   }
 }

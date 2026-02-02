@@ -21,11 +21,15 @@ dependencies:
   permission_handler: any
   flutter_contacts: any
   url_launcher: any
+  record: any
   photo_manager: any
   in_app_update: any
   package_info_plus: any
   flutter_secure_storage: any
   crypto: any
+  geolocator: any
+  geocoding: any
+  image_painter: any
 
 flutter:
   uses-material-design: true
