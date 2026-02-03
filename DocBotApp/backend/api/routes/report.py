@@ -52,12 +52,17 @@ class OrganizeRequest(BaseModel):
 
 @router.post("/start")
 def start_report(payload: StartReportRequest, user=Depends(get_current_user)):
+    from data.voice_transcriber import reset_report_usage
+    
     session = report_manager.create_session(
         user.user_id,
         location=payload.location or "",
         template_key=payload.template_key or "",
         project_name=payload.project_name or "",
     )
+    # Reset per-report transcription counter
+    reset_report_usage(user.user_id)
+    
     if payload.location:
         locations_manager.add_location(user.user_id, payload.location)
     stats_manager.increment(user.user_id, "reports_started")
@@ -169,6 +174,16 @@ def update_item(item_id: str, payload: UpdateItemRequest, user=Depends(get_curre
     return {"status": "ok"}
 
 
+@router.delete("/item/{item_id}")
+def delete_item(item_id: str, user=Depends(get_current_user)):
+    try:
+        report_manager.delete_item(user.user_id, item_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    log_event(user.user_id, "DELETE_ITEM", {"item_id": item_id})
+    return {"status": "ok"}
+
+
 @router.post("/photo")
 async def add_photo(
     item_id: Optional[str] = Form(None),
@@ -213,28 +228,36 @@ async def transcribe(
     language: Optional[str] = Form(None),
     user=Depends(get_current_user),
 ):
-    if language:
-        language = language.lower()
-        if language == "iw":
-            language = "he"
+    from data.voice_transcriber import transcribe_audio, get_remaining_seconds
+    
     suffix = Path(file.filename or "audio.m4a").suffix or ".m4a"
     audio_path = user_temp_dir(user.user_id) / f"audio_{uuid4().hex}{suffix}"
     content = await file.read()
     with open(audio_path, "wb") as f:
         f.write(content)
+    
     try:
-        text = transcribe_audio(str(audio_path), language=language)
+        text, error_key = transcribe_audio(str(audio_path), user_id=user.user_id)
     finally:
         try:
             audio_path.unlink()
         except Exception:
             pass
+    
+    report_remaining, total_remaining = get_remaining_seconds(user.user_id)
+    
     log_event(
         user.user_id,
         "TRANSCRIBE_AUDIO",
-        {"language": language or "", "bytes": len(content)},
+        {"bytes": len(content), "error": error_key},
     )
-    return {"text": text}
+    
+    return {
+        "text": text,
+        "error_key": error_key,
+        "remaining_report_seconds": report_remaining,
+        "remaining_total_seconds": total_remaining,
+    }
 
 
 @router.post("/finalize")
@@ -258,12 +281,14 @@ async def finalize_report(
         with open(logo_path, "wb") as f:
             f.write(content)
 
-    session = report_manager.finalize(user.user_id)
-    
     # Use profile logo if no logo provided in request
     final_logo_path = str(logo_path) if logo_path else user.logo_path
     
+    # Generate DOCX first (before finalize) so if it fails, session is preserved
     doc_path = generate_report_docx(session, logo_path=final_logo_path)
+
+    # Only finalize after successful generation
+    session = report_manager.finalize(user.user_id)
 
     if logo_path:
         try:
@@ -301,15 +326,15 @@ async def finalize_report_pdf(
         with open(logo_path, "wb") as f:
             f.write(content)
 
-    session = report_manager.finalize(user.user_id)
     # Use profile logo if no logo provided in request
     final_logo_path = str(logo_path) if logo_path else user.logo_path
 
-    # For now, we still generate DOCX and then we would ideally convert to PDF.
-    # Since direct DOCX->PDF is hard without external tools, 
-    # I will implement a basic PDF generator using fpdf2 for Hebrew support.
+    # Generate PDF first (before finalize) so if it fails, session is preserved
     from data.pdf_generator import generate_report_pdf
     pdf_path = generate_report_pdf(session, logo_path=final_logo_path)
+
+    # Only finalize after successful generation
+    session = report_manager.finalize(user.user_id)
 
     if logo_path:
         try:
@@ -359,4 +384,13 @@ def organize_report(report_id: str, payload: OrganizeRequest, user=Depends(get_c
         "ORGANIZE_REPORT",
         {"report_id": report_id, "folder": payload.folder, "tags": payload.tags},
     )
+    return {"status": "ok"}
+
+
+@router.delete("/{report_id}")
+def delete_report(report_id: str, user=Depends(get_current_user)):
+    result = report_store.delete_report(user.user_id, report_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Report not found")
+    log_event(user.user_id, "DELETE_REPORT", {"report_id": report_id})
     return {"status": "ok"}

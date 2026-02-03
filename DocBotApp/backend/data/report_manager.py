@@ -80,6 +80,12 @@ class ReportManager:
         self._sessions: dict[int, ReportSession] = {}
 
     def create_session(self, user_id: int, location: str = "", template_key: str = "", project_name: str = "") -> ReportSession:
+        # Clear any existing session first
+        self._sessions.pop(user_id, None)
+        path = user_session_file(user_id)
+        if path.exists():
+            path.unlink()
+        
         template = get_template(template_key) if template_key else get_template("INSPECTION_REPORT")
         session = ReportSession(
             user_id=user_id,
@@ -152,6 +158,21 @@ class ReportManager:
                 self._save_session(session)
                 return
         raise ValueError("Item not found")
+
+    def delete_item(self, user_id: int, item_id: str) -> None:
+        session = self.get_session(user_id)
+        if not session:
+            raise ValueError("No active report")
+        original_len = len(session.items)
+        session.items = [item for item in session.items if item.id != item_id]
+        if len(session.items) == original_len:
+            raise ValueError("Item not found")
+        # Also remove photos associated with this item
+        session.photos = [photo for photo in session.photos if photo.item_id != item_id]
+        # Renumber remaining items
+        for i, item in enumerate(session.items, start=1):
+            item.number = str(i)
+        self._save_session(session)
 
     def load_from_report(self, user_id: int, session_data: dict) -> ReportSession:
         session = ReportSession.from_dict(session_data)

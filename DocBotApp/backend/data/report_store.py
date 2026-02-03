@@ -101,6 +101,23 @@ class ReportStore:
             self._save_index(user_id, updated)
         return result
 
+    def delete_report(self, user_id: int, report_id: str) -> bool:
+        """Delete a report and its associated files."""
+        # Remove from index
+        summaries = self.list_reports(user_id)
+        original_len = len(summaries)
+        summaries = [s for s in summaries if s.report_id != report_id]
+        if len(summaries) == original_len:
+            return False  # Report not found
+        self._save_index(user_id, summaries)
+        
+        # Delete report directory
+        report_dir = user_report_data_dir(user_id, report_id)
+        if report_dir.exists():
+            shutil.rmtree(report_dir)
+        
+        return True
+
     def _append_summary(self, user_id: int, summary: ReportSummary) -> None:
         summaries = self.list_reports(user_id)
         summaries.insert(0, summary)

@@ -6,4 +6,5 @@ bcrypt==4.0.1
 PyJWT
 python-docx
 python-dotenv
-openai-whisper
+httpx
+fpdf2

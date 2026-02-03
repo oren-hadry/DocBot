@@ -149,6 +149,7 @@ def generate_report_docx(session: ReportSession, logo_path: Optional[str] = None
 
     doc.add_heading(labels["findings"], level=2)
     table = doc.add_table(rows=1, cols=4)
+    table.style = "Table Grid"  # Add visible borders
     table.alignment = 2 # Right align the table on the page
     table.autofit = False
     table.columns[0].width = Inches(0.5)

@@ -142,25 +142,36 @@ Future<void> clearUserFiles(BuildContext context) async {
 
   try {
     final dir = await getApplicationDocumentsDirectory();
+    int deletedCount = 0;
+    
     // 1. Clear photo backups
     final backupDir = Directory("${dir.path}/photo_backups");
     if (await backupDir.exists()) {
       await backupDir.delete(recursive: true);
       await backupDir.create();
     }
-    // 2. Clear temp media in app_flutter
+    
+    // 2. Clear temp media and report files
     final list = dir.listSync();
     for (final item in list) {
       if (item is File) {
-        final name = item.uri.pathSegments.last;
-        if (name.startsWith("res_timestamp")) {
+        final name = item.uri.pathSegments.last.toLowerCase();
+        // Delete temp files, reports (pdf/docx), and recordings
+        if (name.startsWith("res_timestamp") ||
+            name.endsWith(".pdf") ||
+            name.endsWith(".docx") ||
+            name.startsWith("report_") ||
+            name.endsWith(".m4a") ||
+            name.endsWith(".wav")) {
           await item.delete();
+          deletedCount++;
         }
       }
     }
+    
     if (context.mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(t(context, "clean_files_success"))),
+        SnackBar(content: Text("${t(context, "clean_files_success")} ($deletedCount)")),
       );
     }
   } catch (e) {
@@ -748,11 +759,31 @@ class ApiClient {
     }
   }
 
+  Future<void> deleteItem(String itemId) async {
+    final resp = await http.delete(
+      Uri.parse("$apiBaseUrl/reports/item/$itemId"),
+      headers: _headers(),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception(resp.body);
+    }
+  }
+
   Future<void> organizeReport(String reportId, String folder, List<String> tags) async {
     final resp = await http.post(
       Uri.parse("$apiBaseUrl/reports/$reportId/organize"),
       headers: _headers(),
       body: jsonEncode({"folder": folder, "tags": tags}),
+    );
+    if (resp.statusCode != 200) {
+      throw Exception(resp.body);
+    }
+  }
+
+  Future<void> deleteReport(String reportId) async {
+    final resp = await http.delete(
+      Uri.parse("$apiBaseUrl/reports/$reportId"),
+      headers: _headers(),
     );
     if (resp.statusCode != 200) {
       throw Exception(resp.body);
@@ -916,7 +947,8 @@ class ApiClient {
     } catch (_) {}
   }
 
-  Future<String> transcribeAudio(File file, {String? language}) async {
+  /// Returns a map with: text, error_key, remaining_report_seconds, remaining_total_seconds
+  Future<Map<String, dynamic>> transcribeAudio(File file, {String? language}) async {
     final req = http.MultipartRequest(
       "POST",
       Uri.parse("$apiBaseUrl/reports/transcribe"),
@@ -932,7 +964,12 @@ class ApiClient {
       throw Exception(body);
     }
     final data = jsonDecode(body) as Map<String, dynamic>;
-    return (data["text"] ?? "").toString();
+    return {
+      "text": (data["text"] ?? "").toString(),
+      "error_key": (data["error_key"] ?? "").toString(),
+      "remaining_report_seconds": data["remaining_report_seconds"] ?? 30,
+      "remaining_total_seconds": data["remaining_total_seconds"] ?? 300,
+    };
   }
 
   Future<Map<String, dynamic>> getMe() async {
@@ -1401,7 +1438,26 @@ class _StartReportScreenState extends State<StartReportScreen> {
     try {
       final existing = await _getActiveSession();
       if (existing != null) {
-        if (mounted) {
+        // Ask user if they want to continue existing report or start fresh
+        final choice = await showDialog<String>(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: Text(t(context, "existing_report_title")),
+            content: Text(t(context, "existing_report_body")),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop("new"),
+                child: Text(t(context, "start_new_button")),
+              ),
+              ElevatedButton(
+                onPressed: () => Navigator.of(context).pop("continue"),
+                child: Text(t(context, "continue_existing_button")),
+              ),
+            ],
+          ),
+        );
+        
+        if (choice == "continue" && mounted) {
           Navigator.of(context).push(
             MaterialPageRoute(
               builder: (_) => ContactsScreen(
@@ -1413,8 +1469,13 @@ class _StartReportScreenState extends State<StartReportScreen> {
               ),
             ),
           );
+          return;
+        } else if (choice == "new") {
+          // Cancel existing and start new
+          await api.cancelReport();
+        } else {
+          return; // User dismissed dialog
         }
-        return;
       }
       if (selectedTemplateKey == null) {
         setState(() => error = t(context, "error_no_template"));
@@ -2054,9 +2115,8 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
       if (mounted) {
         Navigator.of(context).push(
           MaterialPageRoute(
-            builder: (_) => ContactsScreen(
-              initialLocation: report.location,
-              templateKey: report.templateKey,
+            builder: (_) => AddItemScreen(
+              location: report.location,
               templateTitle: appLocale.value.languageCode == "he" ? report.titleHe : report.title,
             ),
           ),
@@ -2131,6 +2191,40 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
         .toList();
     await api.organizeReport(report.reportId, folderController.text.trim(), tags);
     await _load();
+  }
+
+  Future<void> _deleteReport(ReportSummary report) async {
+    final title = appLocale.value.languageCode == "he" ? report.titleHe : report.title;
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(t(context, "delete_report_title")),
+        content: Text("${t(context, "delete_report_body")}\n\n$title\n${report.location}"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(t(context, "cancel_button")),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(t(context, "delete_button")),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true) return;
+    
+    try {
+      await api.deleteReport(report.reportId);
+      await _load();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error: $e")),
+        );
+      }
+    }
   }
 
   @override
@@ -2213,17 +2307,22 @@ class _RecentReportsScreenState extends State<RecentReportsScreen> {
         title: Text(appLocale.value.languageCode == "he" ? report.titleHe : report.title),
         subtitle: Text(subtitleParts.join(" • ")),
         trailing: Wrap(
-          spacing: 8,
+          spacing: 4,
           children: [
             IconButton(
-              icon: const Icon(Icons.edit),
+              icon: const Icon(Icons.edit, size: 20),
               onPressed: loading ? null : () => _openForEdit(report),
               tooltip: t(context, "edit_report_button"),
             ),
             IconButton(
-              icon: const Icon(Icons.folder),
+              icon: const Icon(Icons.folder, size: 20),
               onPressed: loading ? null : () => _organize(report),
               tooltip: t(context, "organize_report_button"),
+            ),
+            IconButton(
+              icon: Icon(Icons.delete_outline, size: 20, color: Colors.red[400]),
+              onPressed: loading ? null : () => _deleteReport(report),
+              tooltip: t(context, "delete_report_title"),
             ),
           ],
         ),
@@ -2561,13 +2660,29 @@ class _AddItemScreenState extends State<AddItemScreen> {
 
   Future<bool> _ensureActiveItemForMedia() async {
     if (activeItemId != null) return true;
-    if (existingItems.isNotEmpty) {
-      final selected = await _promptForItemSelection();
-      if (selected != null) {
-        setState(() => activeItemId = selected);
-        return true;
+    
+    // If there's text in the controllers, save it first before creating the item
+    final descriptionTrimmed = descriptionController.text.trim();
+    final notesTrimmed = notesController.text.trim();
+    
+    if (descriptionTrimmed.isNotEmpty || notesTrimmed.isNotEmpty) {
+      // Save the text as a new item
+      try {
+        final id = await api.addItem(descriptionTrimmed, notesTrimmed);
+        setState(() {
+          currentItemId = id;
+          activeItemId = id;
+          editingItemId = id; // Set to the new item so "Add Item" will update, not create another
+        });
+        await _loadExistingItems();
+        return activeItemId != null;
+      } catch (e) {
+        setState(() => error = e.toString());
+        return false;
       }
     }
+    
+    // If no text, create an empty item
     await _createEmptyItem();
     return activeItemId != null;
   }
@@ -2812,12 +2927,55 @@ class _AddItemScreenState extends State<AddItemScreen> {
       final path = await api.finalizeAndSave(filename: filename, logoFile: logo, pdf: pdf);
       _hideLoading();
       if (mounted) {
-        Navigator.of(context).pushReplacement(
+        Navigator.of(context).push(
           MaterialPageRoute(builder: (_) => DoneScreen(filePath: path)),
         );
       }
     } catch (e) {
       if (mounted) _hideLoading();
+      setState(() => error = e.toString());
+    }
+  }
+
+  Future<void> _deleteItem(String itemId) async {
+    final item = existingItems.firstWhere((i) => i.id == itemId, orElse: () => ReportItemData(id: "", number: "", description: "", notes: ""));
+    final label = item.description.isNotEmpty ? item.description : (item.notes.isNotEmpty ? item.notes : t(context, "item") + " ${item.number}");
+    
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(t(context, "delete_item_title")),
+        content: Text("${t(context, "delete_item_body")}\n\n$label"),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: Text(t(context, "cancel_button")),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text(t(context, "delete_button")),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true) return;
+    
+    try {
+      await api.deleteItem(itemId);
+      if (mounted) {
+        setState(() {
+          if (activeItemId == itemId) {
+            activeItemId = null;
+            currentItemId = null;
+            editingItemId = null;
+            descriptionController.clear();
+            notesController.clear();
+          }
+        });
+        await _loadExistingItems();
+      }
+    } catch (e) {
       setState(() => error = e.toString());
     }
   }
@@ -3012,11 +3170,19 @@ class _AddItemScreenState extends State<AddItemScreen> {
           }
           final language = _resolveTranscriptionLanguage();
           _showLoading(t(context, "transcribing_loading"));
-          final transcript = await api.transcribeAudio(File(path), language: language);
+          final result = await api.transcribeAudio(File(path), language: language);
           _hideLoading();
           try {
             await File(path).delete();
           } catch (_) {}
+          
+          final errorKey = result["error_key"] as String? ?? "";
+          if (errorKey.isNotEmpty) {
+            setState(() => error = t(context, errorKey));
+            return;
+          }
+          
+          final transcript = result["text"] as String? ?? "";
           if (transcript.trim().isEmpty) {
             setState(() => error = t(context, "transcription_error"));
             return;
@@ -3149,6 +3315,12 @@ class _AddItemScreenState extends State<AddItemScreen> {
                     subtitle: Text(item.notes, maxLines: 1, overflow: TextOverflow.ellipsis),
                     selected: item.id == activeItemId,
                     selectedTileColor: Theme.of(context).colorScheme.primary.withOpacity(0.08),
+                    trailing: IconButton(
+                      icon: const Icon(Icons.delete_outline, size: 20),
+                      color: Colors.red[400],
+                      tooltip: t(context, "delete_item_title"),
+                      onPressed: () => _deleteItem(item.id),
+                    ),
                     onTap: () {
                       setState(() {
                         activeItemId = item.id;
@@ -3326,6 +3498,15 @@ class _AddItemScreenState extends State<AddItemScreen> {
             onPressed: () => _finalize(pdf: false),
             child: Text(t(context, "generate_docx_button")),
           ),
+          const SizedBox(height: 24),
+          const Divider(),
+          const SizedBox(height: 8),
+          TextButton.icon(
+            style: TextButton.styleFrom(foregroundColor: Colors.red),
+            onPressed: _cancelReport,
+            icon: const Icon(Icons.cancel_outlined),
+            label: Text(t(context, "cancel_report_button")),
+          ),
         ],
       ),
     );
@@ -3376,44 +3557,56 @@ class DoneScreen extends StatelessWidget {
     }
   }
 
+  void _goToStart(BuildContext context) {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const StartReportScreen()),
+      (route) => false,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(
-        actions: appBarActions(context, showLogout: true),
-      ),
-      body: Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(t(context, "report_generated")),
-            const SizedBox(height: 8),
-            Text(filePath, textAlign: TextAlign.center),
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: _openFile,
-              child: Text(t(context, "open_report_button")),
-            ),
-            const SizedBox(height: 8),
-            OutlinedButton(
-              onPressed: _shareFile,
-              child: Text(t(context, "share_report_button")),
-            ),
-            if (!kIsWeb && Platform.isAndroid) ...[
+    return WillPopScope(
+      onWillPop: () async {
+        _goToStart(context);
+        return false;
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          automaticallyImplyLeading: false,
+          actions: appBarActions(context, showLogout: true),
+        ),
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(t(context, "report_generated")),
+              const SizedBox(height: 8),
+              Text(filePath, textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              ElevatedButton(
+                onPressed: _openFile,
+                child: Text(t(context, "open_report_button")),
+              ),
               const SizedBox(height: 8),
               OutlinedButton(
-                onPressed: () => _saveToDownloads(context),
-                child: Text(t(context, "save_downloads_button")),
+                onPressed: _shareFile,
+                child: Text(t(context, "share_report_button")),
+              ),
+              if (!kIsWeb && Platform.isAndroid) ...[
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: () => _saveToDownloads(context),
+                  child: Text(t(context, "save_downloads_button")),
+                ),
+              ],
+              const SizedBox(height: 12),
+              ElevatedButton(
+                onPressed: () => _goToStart(context),
+                child: Text(t(context, "new_report_button")),
               ),
             ],
-            const SizedBox(height: 12),
-            ElevatedButton(
-              onPressed: () => Navigator.of(context).pushReplacement(
-                MaterialPageRoute(builder: (_) => const StartReportScreen()),
-              ),
-              child: Text(t(context, "new_report_button")),
-            ),
-          ],
+          ),
         ),
       ),
     );
